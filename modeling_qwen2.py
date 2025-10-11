@@ -428,6 +428,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
             self.embed_tokens = new_embeddings
             # 更新vocab_size
             self.vocab_size = self.beacon_token_id + 1
+            self.config.vocab_size = self.vocab_size
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -780,6 +781,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
             new_lm_head = new_lm_head.to(dtype=old_lm_head.weight.dtype, device=old_lm_head.weight.device)
             model.lm_head = new_lm_head
             model.vocab_size = model.model.vocab_size
+            model.config.vocab_size = model.model.vocab_size
         
         return model
 
