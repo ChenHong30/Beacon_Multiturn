@@ -436,7 +436,9 @@ class Qwen2Model(Qwen2PreTrainedModel):
     def set_input_embeddings(self, value):
         self.embed_tokens = value
     
-    def parse_multiturn_dialogue(self, input_ids: torch.Tensor) -> tuple[list, torch.Tensor, torch.Tensor]:
+    def parse_multiturn_dialogue(
+        self, input_ids: torch.Tensor, labels: Optional[torch.Tensor] = None
+    ) -> tuple[list, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """
         解析多轮对话序列，识别每个QA轮次，并在每个轮次末尾添加beacon token
         
@@ -444,17 +446,21 @@ class Qwen2Model(Qwen2PreTrainedModel):
             qa_segments: 每个QA轮次的起始和结束位置列表
             modified_input_ids: 添加了beacon token的input_ids
             beacon_positions: beacon token的位置mask
+            modified_labels: 若提供labels，则返回与modified_input_ids对齐的labels（beacon位置填充为-100）
         """
         batch_size, seq_len = input_ids.shape
         qa_segments = []
         modified_input_ids_list = []
         beacon_positions_list = []
+        modified_labels_list = [] if labels is not None else None
         
         for batch_idx in range(batch_size):
             ids = input_ids[batch_idx].tolist()
+            label_row = labels[batch_idx].tolist() if labels is not None else None
             segments = []
             modified_ids = []
             beacon_pos = []
+            modified_label_ids = [] if labels is not None else None
             
             # 查找所有的<|im_start|>和<|im_end|>位置
             start_positions = [i for i, token_id in enumerate(ids) if token_id == self.im_start_id]
@@ -464,6 +470,9 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 # 只有一个或没有对话轮次，不进行beacon处理
                 modified_input_ids_list.append(ids)
                 beacon_positions_list.append([0] * len(ids))
+                qa_segments.append([])
+                if labels is not None and modified_labels_list is not None:
+                    modified_labels_list.append(label_row)
                 continue
             
             # 配对start和end位置
@@ -475,6 +484,9 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 segment_tokens = ids[current_pos:end_pos + 1]
                 modified_ids.extend(segment_tokens)
                 beacon_pos.extend([0] * len(segment_tokens))
+                if labels is not None and modified_label_ids is not None:
+                    segment_labels = label_row[current_pos:end_pos + 1]
+                    modified_label_ids.extend(segment_labels)
                 
                 # 识别段落类型
                 segment_content = segment_tokens[start_pos-current_pos:end_pos-current_pos+1] if start_pos >= current_pos else segment_tokens
@@ -492,6 +504,8 @@ class Qwen2Model(Qwen2PreTrainedModel):
                     modified_ids.append(self.beacon_token_id)
                     beacon_pos.append(1)  # 标记这是beacon token位置
                     segments.append((current_pos, len(modified_ids) - 1))  # 记录这个QA段落的范围
+                    if labels is not None and modified_label_ids is not None:
+                        modified_label_ids.append(-100)  # beacon位置不参与loss
                 
                 current_pos = end_pos + 1
             
@@ -500,18 +514,24 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 remaining_tokens = ids[current_pos:]
                 modified_ids.extend(remaining_tokens)
                 beacon_pos.extend([0] * len(remaining_tokens))
+                if labels is not None and modified_label_ids is not None:
+                    remaining_labels = label_row[current_pos:]
+                    modified_label_ids.extend(remaining_labels)
             
             modified_input_ids_list.append(modified_ids)
             beacon_positions_list.append(beacon_pos)
             qa_segments.append(segments)
+            if labels is not None and modified_labels_list is not None:
+                modified_labels_list.append(modified_label_ids)
         
         # 将列表转换为tensor，需要padding到相同长度
         max_len = max(len(ids) for ids in modified_input_ids_list)
         
         padded_input_ids = []
         padded_beacon_pos = []
+        padded_labels = [] if modified_labels_list is not None else None
         
-        for ids, beacon_pos in zip(modified_input_ids_list, beacon_positions_list):
+        for index, (ids, beacon_pos) in enumerate(zip(modified_input_ids_list, beacon_positions_list)):
             # padding
             pad_len = max_len - len(ids)
             padded_ids = ids + [self.config.pad_token_id] * pad_len
@@ -519,11 +539,19 @@ class Qwen2Model(Qwen2PreTrainedModel):
             
             padded_input_ids.append(padded_ids)
             padded_beacon_pos.append(padded_pos)
+            
+            if padded_labels is not None and modified_labels_list is not None:
+                label_ids = modified_labels_list[index]
+                pad_labels = label_ids + [-100] * pad_len
+                padded_labels.append(pad_labels)
         
         modified_input_ids = torch.tensor(padded_input_ids, dtype=input_ids.dtype, device=input_ids.device)
         beacon_positions = torch.tensor(padded_beacon_pos, dtype=torch.bool, device=input_ids.device)
+        modified_labels_tensor = None
+        if padded_labels is not None:
+            modified_labels_tensor = torch.tensor(padded_labels, dtype=labels.dtype, device=labels.device)
         
-        return qa_segments, modified_input_ids, beacon_positions
+        return qa_segments, modified_input_ids, beacon_positions, modified_labels_tensor
     
     def compress_kv_cache(self, past_key_values: Cache, beacon_positions: torch.Tensor) -> Cache:
         """
@@ -566,6 +594,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Cache] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
@@ -573,6 +602,14 @@ class Qwen2Model(Qwen2PreTrainedModel):
         enable_beacon_compression: Optional[bool] = True,
         **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
     ) -> BaseModelOutputWithPast:
+        r"""
+        Args:
+            labels (`torch.LongTensor`, *optional*):
+                Training labels aligned with `input_ids`. When beacon tokens are injected, the labels are automatically
+                expanded with `-100` at beacon positions.
+            enable_beacon_compression (`bool`, *optional*, defaults to `True`):
+                Whether to parse multi-turn dialogues and insert beacon tokens during the prefill stage.
+        """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -600,13 +637,16 @@ class Qwen2Model(Qwen2PreTrainedModel):
         if (input_ids is not None and enable_beacon_compression and 
             past_key_values is None):
             # 解析多轮对话并添加beacon token
-            qa_segments, modified_input_ids, beacon_positions = self.parse_multiturn_dialogue(input_ids)
+            qa_segments, modified_input_ids, beacon_positions, modified_labels = self.parse_multiturn_dialogue(
+                input_ids, labels
+            )
             
             # 如果检测到多轮对话，使用修改后的input_ids
             if torch.any(beacon_positions):
                 input_ids = modified_input_ids
+                if modified_labels is not None:
+                    labels = modified_labels
                 print(f"预填充阶段：检测到多轮对话，添加了 {torch.sum(beacon_positions).item()} 个beacon token")
-        
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
@@ -696,12 +736,17 @@ class Qwen2Model(Qwen2PreTrainedModel):
             past_key_values = self.compress_kv_cache(past_key_values, beacon_positions)
             print(f"预填充阶段完成：KV cache已压缩，只保留 {torch.sum(beacon_positions).item()} 个beacon token的KV")
 
-        return BaseModelOutputWithPast(
+        outputs = BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values if use_cache else None,
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
         )
+        outputs.beacon_positions = beacon_positions
+        if labels is not None:
+            outputs.adjusted_labels = labels
+
+        return outputs
 
 
 class KwargsForCausalLM(FlashAttentionKwargs, LossKwargs): ...
@@ -808,6 +853,9 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
             Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
             config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
             (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
+        enable_beacon_compression (`bool`, *optional*, defaults to `True`):
+            Controls whether multi-turn prompts are augmented with beacon tokens during the prefill stage so that the
+            beacon projections and KV compression logic are exercised.
 
         Example:
 
@@ -842,6 +890,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
             position_ids=position_ids,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
+            labels=labels,
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
@@ -857,6 +906,8 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
 
         loss = None
         if labels is not None:
+            if hasattr(outputs, "adjusted_labels"):
+                labels = outputs.adjusted_labels
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
 
         return CausalLMOutputWithPast(
