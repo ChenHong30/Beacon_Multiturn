@@ -646,7 +646,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 input_ids = modified_input_ids
                 if modified_labels is not None:
                     labels = modified_labels
-                print(f"预填充阶段：检测到多轮对话，添加了 {torch.sum(beacon_positions).item()} 个beacon token")
+                # print(f"预填充阶段：检测到多轮对话，添加了 {torch.sum(beacon_positions).item()} 个beacon token")
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
@@ -734,7 +734,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
         if (use_cache and beacon_positions is not None and torch.any(beacon_positions) and 
             past_key_values is not None):
             past_key_values = self.compress_kv_cache(past_key_values, beacon_positions)
-            print(f"预填充阶段完成：KV cache已压缩，只保留 {torch.sum(beacon_positions).item()} 个beacon token的KV")
+            # print(f"预填充阶段完成：KV cache已压缩，只保留 {torch.sum(beacon_positions).item()} 个beacon token的KV")
 
         outputs = BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
