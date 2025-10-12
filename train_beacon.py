@@ -2,12 +2,17 @@ import argparse
 import inspect
 import json
 import logging
+import math
 import os
 from typing import Any, Dict, List, Optional
 
+import numpy as np
+
+import math
+
 import torch
 from datasets import DatasetDict, load_dataset, load_from_disk
-from transformers import AutoTokenizer, DataCollatorForLanguageModeling, Trainer, TrainingArguments
+from transformers import AutoTokenizer, DataCollatorForLanguageModeling, Trainer, TrainingArguments, TrainerCallback
 
 from modeling_qwen2 import Qwen2ForCausalLM
 
@@ -209,6 +214,11 @@ def prepare_dataset(
     dataset = load_dataset("json", data_files=data_path, split="train")
     logger.info("Loaded %d raw conversations", len(dataset))
 
+    newline_token_ids = tokenizer("\n", add_special_tokens=False)["input_ids"]
+    newline_token_id = newline_token_ids[-1] if newline_token_ids else None
+    im_start_id = tokenizer.convert_tokens_to_ids("<|im_start|>")
+    im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+
     def preprocess(batch: Dict[str, List[Any]]) -> Dict[str, List[List[int]]]:
         input_ids_batch: List[List[int]] = []
         attention_masks_batch: List[List[int]] = []
@@ -219,25 +229,66 @@ def prepare_dataset(
                 continue
 
             messages = build_messages(turns, system_prompt)
-            chat = tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=False,
-            )
-            tokenised = tokenizer(
-                chat,
-                max_length=max_length,
-                padding=False,
-                truncation=True,
-            )
-            input_ids = tokenised["input_ids"]
-            attention_mask = tokenised["attention_mask"]
-            if len(input_ids) < 2:
+            expanded_ids: List[int] = []
+            expanded_labels: List[int] = []
+
+            for message in messages:
+                role = message["role"]
+                content = message["content"]
+                chunk = f"<|im_start|>{role}\n{content}<|im_end|>\n"
+                tokenised = tokenizer(chunk, add_special_tokens=False)
+                chunk_ids = tokenised["input_ids"]
+                if len(chunk_ids) == 0:
+                    continue
+
+                chunk_labels = [-100] * len(chunk_ids)
+                if role == "assistant":
+                    chunk_labels = chunk_ids.copy()
+
+                    # mask prefix tokens (<|im_start|>, role, leading newline)
+                    prefix_end = 0
+                    if newline_token_id is not None:
+                        for idx, token_id in enumerate(chunk_ids):
+                            if token_id == newline_token_id:
+                                prefix_end = idx
+                                break
+                        else:
+                            prefix_end = min(2, len(chunk_ids) - 1)
+                    else:
+                        prefix_end = min(2, len(chunk_ids) - 1)
+                    for idx in range(prefix_end + 1):
+                        chunk_labels[idx] = -100
+
+                    # mask trailing special tokens (<|im_end|> and trailing newline)
+                    for idx in range(len(chunk_ids) - 2, len(chunk_ids)):
+                        if idx >= 0:
+                            chunk_labels[idx] = -100
+
+                    # fallback to ensure <|im_start|> and <|im_end|> always masked
+                    if im_start_id is not None and chunk_ids[0] == im_start_id:
+                        chunk_labels[0] = -100
+                    if im_end_id is not None and chunk_ids[-2] == im_end_id:
+                        chunk_labels[-2] = -100
+
+                expanded_ids.extend(chunk_ids)
+                expanded_labels.extend(chunk_labels)
+
+            if len(expanded_ids) == 0:
                 continue
 
-            input_ids_batch.append(input_ids)
+            attention_mask = [1] * len(expanded_ids)
+
+            if len(expanded_ids) > max_length:
+                expanded_ids = expanded_ids[:max_length]
+                attention_mask = attention_mask[:max_length]
+                expanded_labels = expanded_labels[:max_length]
+
+            if not any(label != -100 for label in expanded_labels):
+                continue
+
+            input_ids_batch.append(expanded_ids)
             attention_masks_batch.append(attention_mask)
-            labels_batch.append(input_ids.copy())
+            labels_batch.append(expanded_labels)
 
         return {
             "input_ids": input_ids_batch,
@@ -305,6 +356,51 @@ def freeze_non_beacon_parameters(model: Qwen2ForCausalLM, train_lm_head: bool) -
     )
 
 
+def compute_metrics(eval_pred):
+    predictions, labels = eval_pred
+    if isinstance(predictions, tuple):
+        predictions = predictions[0]
+    if isinstance(labels, tuple):
+        labels = labels[0]
+    if predictions is None:
+        return {}
+    preds = np.argmax(predictions, axis=-1)
+    mask = labels != -100
+    valid_tokens = mask.sum()
+    if valid_tokens == 0:
+        token_accuracy = 0.0
+    else:
+        correct = (preds == labels) & mask
+        token_accuracy = correct.sum() / valid_tokens
+    return {"token_accuracy": float(token_accuracy)}
+
+
+class JsonlLoggerCallback(TrainerCallback):
+    def __init__(self, log_path: str):
+        self.log_path = log_path
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        with open(self.log_path, "w", encoding="utf-8") as f:
+            f.write("")
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if logs is None:
+            return
+        record = dict(logs)
+        record["step"] = state.global_step
+        record["epoch"] = state.epoch
+        if "loss" in record:
+            try:
+                record["perplexity"] = math.exp(min(record["loss"], 100))
+            except OverflowError:
+                record["perplexity"] = float("inf")
+        if "eval_loss" in record:
+            try:
+                record["eval_perplexity"] = math.exp(min(record["eval_loss"], 100))
+            except OverflowError:
+                record["eval_perplexity"] = float("inf")
+        with open(self.log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
 def main() -> None:
     args = parse_args()
     logging.basicConfig(
@@ -354,6 +450,8 @@ def main() -> None:
     data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
     os.makedirs(args.output_dir, exist_ok=True)
+    logging_dir = os.path.join(args.output_dir, "logs")
+    os.makedirs(logging_dir, exist_ok=True)
 
     evaluation_strategy = "steps" if eval_dataset is not None else "no"
     training_kwargs = {
@@ -371,6 +469,8 @@ def main() -> None:
         "bf16": args.bf16,
         "fp16": args.fp16,
         "evaluation_strategy": evaluation_strategy,
+        "logging_strategy": "steps",
+        "logging_dir": logging_dir,
         "report_to": "none",
         "dataloader_pin_memory": True,
         "dataloader_drop_last": False,
@@ -379,6 +479,7 @@ def main() -> None:
         "label_names": ["labels"],
         "optim": "adamw_torch",
         "seed": args.seed,
+        "prediction_loss_only": False,
     }
     if eval_dataset is not None:
         training_kwargs["eval_steps"] = args.save_steps
@@ -391,6 +492,8 @@ def main() -> None:
 
     training_args = TrainingArguments(**training_kwargs)
 
+    callbacks = [JsonlLoggerCallback(os.path.join(logging_dir, "training_log.jsonl"))]
+
     trainer = Trainer(
         model=model,
         args=training_args,
@@ -398,6 +501,8 @@ def main() -> None:
         eval_dataset=eval_dataset,
         data_collator=data_collator,
         tokenizer=tokenizer,
+        compute_metrics=compute_metrics if eval_dataset is not None else None,
+        callbacks=callbacks,
     )
 
     trainer.train()

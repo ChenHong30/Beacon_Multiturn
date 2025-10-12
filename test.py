@@ -1,8 +1,14 @@
-import torch
-from transformers import AutoTokenizer, AutoConfig
-from modeling_qwen2 import Qwen2ForCausalLM
 import os
 import gc
+from typing import List, Dict
+
+import torch
+from transformers import AutoConfig, AutoTokenizer
+
+from modeling_qwen2 import Qwen2ForCausalLM
+
+
+CHECKPOINT_PATH = "/home/catlover/projects/Beacon_Multiturn/runs/beacon-ft/checkpoint-16988"
 
 def get_gpu_memory_usage():
     """
@@ -22,12 +28,11 @@ def clear_gpu_cache():
         torch.cuda.empty_cache()
     gc.collect()
 
-def load_qwen_model():
+def load_qwen_model(model_path: str):
     """
     加载Qwen2.5-1.5B-Instruct模型，始终加载到第一张显卡（cuda:0），
     使用本地的modeling_qwen2.py配置
     """
-    model_path = "/hpc2hdd/home/hchen763/jhaidata/local_model/Qwen2.5-1.5B-Instruct"
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"模型路径不存在: {model_path}")
 
@@ -71,6 +76,34 @@ def calculate_kv_cache_size(past_key_values):
     
     return total_size / (1024 * 1024)  # 转换为MB
 
+def render_dialogue(dialogue: List[Dict[str, str]], tokenizer: AutoTokenizer) -> str:
+    """
+    使用tokenizer的chat模板渲染多轮对话文本
+    """
+    return tokenizer.apply_chat_template(
+        dialogue,
+        add_generation_prompt=True,
+        tokenize=False,
+    )
+
+
+def encode_dialogue(dialogue: List[Dict[str, str]], tokenizer: AutoTokenizer, device: torch.device):
+    """
+    使用chat模板编码多轮对话，返回input_ids和attention_mask
+    """
+    encoded = tokenizer.apply_chat_template(
+        dialogue,
+        add_generation_prompt=True,
+        tokenize=True,
+    )
+    if isinstance(encoded[0], list):
+        # apply_chat_template 可能返回嵌套列表（批次），此处保证为一维
+        encoded = encoded[0]
+    input_ids = torch.tensor([encoded], dtype=torch.long, device=device)
+    attention_mask = torch.ones_like(input_ids, device=device)
+    return input_ids, attention_mask
+
+
 def test_multiturn_dialogue(model, tokenizer, device):
     """
     测试多轮对话的beacon压缩功能并比较KV cache大小
@@ -87,19 +120,11 @@ def test_multiturn_dialogue(model, tokenizer, device):
         {"role": "user", "content": "那么1+1等于多少？"}
     ]
     
-    # 手动构建多轮对话的token序列
-    input_text = ""
-    for turn in dialogue:
-        role = turn["role"]
-        content = turn["content"]
-        input_text += f"<|im_start|>{role}\n{content}<|im_end|>\n"
-    
-    print(f"多轮对话输入:\n{input_text}")
+    rendered_text = render_dialogue(dialogue, tokenizer)
+    print(f"多轮对话输入:\n{rendered_text}")
     
     # 编码输入
-    inputs = tokenizer(input_text, return_tensors="pt")
-    input_ids = inputs["input_ids"].to(device)
-    attention_mask = inputs["attention_mask"].to(device)
+    input_ids, attention_mask = encode_dialogue(dialogue, tokenizer, device)
     
     print(f"原始input_ids长度: {input_ids.shape[1]}")
     print(f"原始input_ids: {input_ids[0].tolist()[:50]}...")  # 只显示前50个token
@@ -185,7 +210,7 @@ def test_multiturn_dialogue(model, tokenizer, device):
             pad_token_id=tokenizer.eos_token_id,
             use_cache=True
         )
-        
+
         print(f"生成完成，生成了 {generated_ids.shape[1] - input_ids.shape[1]} 个新token")
     
     # 解码生成的文本
@@ -193,14 +218,17 @@ def test_multiturn_dialogue(model, tokenizer, device):
     print(f"生成的完整文本:\n{generated_text}")
     
     # 只显示新生成的部分
-    original_text = tokenizer.decode(input_ids[0], skip_special_tokens=True)
-    new_text = generated_text[len(original_text):]
+    new_tokens = generated_ids[0, input_ids.shape[1]:]
+    new_text = tokenizer.decode(new_tokens, skip_special_tokens=True).lstrip()
+    if new_text.startswith("assistant"):
+        new_text = new_text[len("assistant") :].lstrip(": \n")
+    print(f"\n新生成的文本: {new_text}")
     print(f"\n新生成的文本: {new_text}")
 
 if __name__ == "__main__":
     try:
         # 加载模型
-        model, tokenizer, config, device = load_qwen_model()
+        model, tokenizer, config, device = load_qwen_model(CHECKPOINT_PATH)
 
         print(f"\n模型信息:")
         print(f"模型类型: {type(model).__name__}")

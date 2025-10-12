@@ -8,6 +8,7 @@
 `train_beacon.py` 会：
 - 用 tokenizer 的 `apply_chat_template` 将每条对话打包为完整的多轮上下文；
 - 让模型内部的 `parse_multiturn_dialogue` 在预填充阶段插入 beacon token，确保 Q/K/V 投影被更新；
+- 只对 assistant 回复部分计算 loss，system/user 段落及特殊 tag 会自动打上 `-100` 避免干扰；
 - 默认执行语言模型交叉熵训练。
 
 ### 启动参数
@@ -41,6 +42,8 @@ python train_beacon.py \
   --train-beacon-only \
   --train-lm-head
 ```
+
+训练日志会写入 `runs/.../logs/training_log.jsonl`，其中包含 step、loss、perplexity、token_accuracy 等指标，可用于后续可视化或排查。
 
 不建议启用 flash attention（部分环境下存在兼容问题）；脚本不会强制改动 `_attn_implementation`。
 
