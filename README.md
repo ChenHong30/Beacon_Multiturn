@@ -29,21 +29,22 @@
 
 ### 启动命令示例
 ```bash
-python train_beacon.py \
-  --data-path lmsys-chat-turn-ge-3.jsonl \
-  --model-path ./Qwen2-0.5B-Instruct \
-  --output-dir ./runs/beacon-ft \
-  --processed-cache-dir ./runs/dataset-cache \
-  --num-epochs 1 \
-  --learning-rate 5e-5 \
-  --per-device-train-batch-size 1 \
-  --gradient-accumulation-steps 8 \
-  --bf16 \
-  --train-beacon-only \
-  --train-lm-head
+  python train_beacon.py \
+    --data-path lmsys-chat-turn-ge-3.jsonl \
+    --model-path ./Qwen2-0.5B-Instruct \
+    --output-dir ./runs/beacon-ft-v2 \
+    --processed-cache-dir ./runs/dataset-cache \
+    --num-epochs 1 \
+    --learning-rate 5e-5 \
+    --per-device-train-batch-size 1 \
+    --gradient-accumulation-steps 8 \
+    --warmup-ratio 0.03 \
+    --bf16 \
+    --train-beacon-only \
+    --train-lm-head
 ```
 
-训练日志会写入 `runs/.../logs/training_log.jsonl`，其中包含 step、loss、perplexity、token_accuracy 等指标，可用于后续可视化或排查。
+训练期间的控制台输出（含启动命令、警告与 Trainer 的逐步日志）会同步写入 `runs/.../logs/training_logs.log` 便于排查。
 
 不建议启用 flash attention（部分环境下存在兼容问题）；脚本不会强制改动 `_attn_implementation`。
 

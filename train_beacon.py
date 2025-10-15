@@ -4,7 +4,9 @@ import json
 import logging
 import math
 import os
-from typing import Any, Dict, List, Optional
+import shlex
+import sys
+from typing import Any, Dict, List, Optional, TextIO
 
 import numpy as np
 
@@ -12,7 +14,7 @@ import math
 
 import torch
 from datasets import DatasetDict, load_dataset, load_from_disk
-from transformers import AutoTokenizer, DataCollatorForLanguageModeling, Trainer, TrainingArguments, TrainerCallback
+from transformers import AutoTokenizer, Trainer, TrainingArguments
 
 from modeling_qwen2 import Qwen2ForCausalLM
 
@@ -375,141 +377,207 @@ def compute_metrics(eval_pred):
     return {"token_accuracy": float(token_accuracy)}
 
 
-class JsonlLoggerCallback(TrainerCallback):
-    def __init__(self, log_path: str):
-        self.log_path = log_path
-        os.makedirs(os.path.dirname(log_path), exist_ok=True)
-        with open(self.log_path, "w", encoding="utf-8") as f:
-            f.write("")
+class Tee:
+    """
+    Mirrors writes to both the original stream and a log file, keeping console output while recording it.
+    """
 
-    def on_log(self, args, state, control, logs=None, **kwargs):
-        if logs is None:
-            return
-        record = dict(logs)
-        record["step"] = state.global_step
-        record["epoch"] = state.epoch
-        if "loss" in record:
-            try:
-                record["perplexity"] = math.exp(min(record["loss"], 100))
-            except OverflowError:
-                record["perplexity"] = float("inf")
-        if "eval_loss" in record:
-            try:
-                record["eval_perplexity"] = math.exp(min(record["eval_loss"], 100))
-            except OverflowError:
-                record["eval_perplexity"] = float("inf")
-        with open(self.log_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    def __init__(self, original: TextIO, log_file: TextIO):
+        self.original = original
+        self.log_file = log_file
+
+    def write(self, data: str) -> None:
+        self.original.write(data)
+        self.log_file.write(data)
+        self.log_file.flush()
+
+    def flush(self) -> None:
+        self.original.flush()
+        self.log_file.flush()
+
+
+class BeaconDataCollator:
+    """
+    Pads variable-length chat examples while preserving precomputed labels.
+    """
+
+    def __init__(self, tokenizer: AutoTokenizer):
+        self.tokenizer = tokenizer
+
+    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        pad_token_id = (
+            self.tokenizer.pad_token_id
+            if self.tokenizer.pad_token_id is not None
+            else self.tokenizer.eos_token_id
+        )
+
+        max_length = max(len(feature["input_ids"]) for feature in features)
+        batch_input_ids: List[List[int]] = []
+        batch_attention_mask: List[List[int]] = []
+        batch_labels: List[List[int]] = []
+
+        for feature in features:
+            input_ids = feature["input_ids"]
+            if isinstance(input_ids, torch.Tensor):
+                input_ids = input_ids.tolist()
+
+            attention_mask = feature.get("attention_mask")
+            if isinstance(attention_mask, torch.Tensor):
+                attention_mask = attention_mask.tolist()
+
+            labels = feature.get("labels")
+            if isinstance(labels, torch.Tensor):
+                labels = labels.tolist()
+
+            pad_len = max_length - len(input_ids)
+
+            padded_input_ids = input_ids + [pad_token_id] * pad_len
+            if attention_mask is None:
+                attention_mask = [1] * len(input_ids)
+            padded_attention_mask = attention_mask + [0] * pad_len
+
+            if labels is None:
+                labels = padded_input_ids.copy()
+            padded_labels = labels + [-100] * pad_len
+
+            batch_input_ids.append(padded_input_ids)
+            batch_attention_mask.append(padded_attention_mask)
+            batch_labels.append(padded_labels)
+
+        return {
+            "input_ids": torch.tensor(batch_input_ids, dtype=torch.long),
+            "attention_mask": torch.tensor(batch_attention_mask, dtype=torch.long),
+            "labels": torch.tensor(batch_labels, dtype=torch.long),
+        }
 
 def main() -> None:
     args = parse_args()
-    logging.basicConfig(
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        level=logging.INFO,
-    )
-
-    torch.manual_seed(args.seed)
-    torch.cuda.manual_seed_all(args.seed)
-
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path, use_fast=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "right"
-
-    train_dataset, eval_dataset = prepare_dataset(
-        data_path=args.data_path,
-        tokenizer=tokenizer,
-        max_length=args.max_length,
-        system_prompt=args.system_prompt,
-        eval_ratio=args.eval_ratio,
-        seed=args.seed,
-        processed_cache_dir=args.processed_cache_dir,
-    )
-
-    model = Qwen2ForCausalLM.from_pretrained(
-        args.model_path,
-        torch_dtype=torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else None),
-        device_map="auto" if torch.cuda.is_available() else None,
-    )
-    model.config.use_cache = False
-
-    if args.gradient_checkpointing:
-        model.gradient_checkpointing_enable()
-
-    if args.train_beacon_only:
-        freeze_non_beacon_parameters(model, train_lm_head=args.train_lm_head)
-    else:
-        total_params = sum(p.numel() for p in model.parameters())
-        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        logger.info(
-            "Training all parameters (%.2fM trainable of %.2fM total)",
-            trainable_params / 1e6,
-            total_params / 1e6,
-        )
-
-    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
     os.makedirs(args.output_dir, exist_ok=True)
     logging_dir = os.path.join(args.output_dir, "logs")
     os.makedirs(logging_dir, exist_ok=True)
+    log_path = os.path.join(logging_dir, "training_logs.log")
 
-    evaluation_strategy = "steps" if eval_dataset is not None else "no"
-    training_kwargs = {
-        "output_dir": args.output_dir,
-        "per_device_train_batch_size": args.per_device_train_batch_size,
-        "per_device_eval_batch_size": args.per_device_eval_batch_size,
-        "gradient_accumulation_steps": args.gradient_accumulation_steps,
-        "num_train_epochs": args.num_epochs,
-        "learning_rate": args.learning_rate,
-        "weight_decay": args.weight_decay,
-        "warmup_ratio": args.warmup_ratio,
-        "logging_steps": args.logging_steps,
-        "save_steps": args.save_steps,
-        "save_total_limit": args.save_total_limit,
-        "bf16": args.bf16,
-        "fp16": args.fp16,
-        "evaluation_strategy": evaluation_strategy,
-        "logging_strategy": "steps",
-        "logging_dir": logging_dir,
-        "report_to": "none",
-        "dataloader_pin_memory": True,
-        "dataloader_drop_last": False,
-        "gradient_checkpointing": args.gradient_checkpointing,
-        "remove_unused_columns": False,
-        "label_names": ["labels"],
-        "optim": "adamw_torch",
-        "seed": args.seed,
-        "prediction_loss_only": False,
-    }
-    if eval_dataset is not None:
-        training_kwargs["eval_steps"] = args.save_steps
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    log_file: Optional[TextIO] = None
+    try:
+        log_file = open(log_path, "w", encoding="utf-8")
+        command = " ".join(shlex.quote(arg) for arg in sys.argv)
+        log_file.write(f"[command] {command}\n")
+        log_file.write(f"[cwd] {os.getcwd()}\n")
+        log_file.write("\n")
+        log_file.flush()
 
-    supported_kwargs = set(inspect.signature(TrainingArguments.__init__).parameters.keys())
-    unsupported = [key for key in list(training_kwargs.keys()) if key not in supported_kwargs]
-    for key in unsupported:
-        logger.warning("Dropping unsupported TrainingArguments argument: %s", key)
-        training_kwargs.pop(key)
+        sys.stdout = Tee(original_stdout, log_file)
+        sys.stderr = Tee(original_stderr, log_file)
 
-    training_args = TrainingArguments(**training_kwargs)
+        logging.basicConfig(
+            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+            level=logging.INFO,
+        )
 
-    callbacks = [JsonlLoggerCallback(os.path.join(logging_dir, "training_log.jsonl"))]
+        torch.manual_seed(args.seed)
+        torch.cuda.manual_seed_all(args.seed)
 
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
-        data_collator=data_collator,
-        tokenizer=tokenizer,
-        compute_metrics=compute_metrics if eval_dataset is not None else None,
-        callbacks=callbacks,
-    )
+        tokenizer = AutoTokenizer.from_pretrained(args.model_path, use_fast=True)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = "right"
 
-    trainer.train()
+        train_dataset, eval_dataset = prepare_dataset(
+            data_path=args.data_path,
+            tokenizer=tokenizer,
+            max_length=args.max_length,
+            system_prompt=args.system_prompt,
+            eval_ratio=args.eval_ratio,
+            seed=args.seed,
+            processed_cache_dir=args.processed_cache_dir,
+        )
 
-    trainer.save_model(args.output_dir)
-    tokenizer.save_pretrained(args.output_dir)
-    logger.info("Training complete. Checkpoint saved to %s", args.output_dir)
+        model = Qwen2ForCausalLM.from_pretrained(
+            args.model_path,
+            torch_dtype=torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else None),
+            device_map="auto" if torch.cuda.is_available() else None,
+        )
+        model.config.use_cache = False
+
+        if args.gradient_checkpointing:
+            model.gradient_checkpointing_enable()
+
+        if args.train_beacon_only:
+            freeze_non_beacon_parameters(model, train_lm_head=args.train_lm_head)
+        else:
+            total_params = sum(p.numel() for p in model.parameters())
+            trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            logger.info(
+                "Training all parameters (%.2fM trainable of %.2fM total)",
+                trainable_params / 1e6,
+                total_params / 1e6,
+            )
+
+        data_collator = BeaconDataCollator(tokenizer=tokenizer)
+
+        evaluation_strategy = "steps" if eval_dataset is not None else "no"
+        training_kwargs = {
+            "output_dir": args.output_dir,
+            "per_device_train_batch_size": args.per_device_train_batch_size,
+            "per_device_eval_batch_size": args.per_device_eval_batch_size,
+            "gradient_accumulation_steps": args.gradient_accumulation_steps,
+            "num_train_epochs": args.num_epochs,
+            "learning_rate": args.learning_rate,
+            "weight_decay": args.weight_decay,
+            "warmup_ratio": args.warmup_ratio,
+            "logging_steps": args.logging_steps,
+            "save_steps": args.save_steps,
+            "save_total_limit": args.save_total_limit,
+            "bf16": args.bf16,
+            "fp16": args.fp16,
+            "evaluation_strategy": evaluation_strategy,
+            "logging_strategy": "steps",
+            "logging_dir": logging_dir,
+            "report_to": "none",
+            "dataloader_pin_memory": True,
+            "dataloader_drop_last": False,
+            "gradient_checkpointing": args.gradient_checkpointing,
+            "remove_unused_columns": False,
+            "label_names": ["labels"],
+            "optim": "adamw_torch",
+            "seed": args.seed,
+            "prediction_loss_only": False,
+        }
+        if eval_dataset is not None:
+            training_kwargs["eval_steps"] = args.save_steps
+
+        supported_kwargs = set(inspect.signature(TrainingArguments.__init__).parameters.keys())
+        unsupported = [key for key in list(training_kwargs.keys()) if key not in supported_kwargs]
+        for key in unsupported:
+            logger.warning("Dropping unsupported TrainingArguments argument: %s", key)
+            training_kwargs.pop(key)
+
+        training_args = TrainingArguments(**training_kwargs)
+
+        trainer = Trainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            data_collator=data_collator,
+            tokenizer=tokenizer,
+            compute_metrics=compute_metrics if eval_dataset is not None else None,
+        )
+
+        trainer.train()
+
+        trainer.save_model(args.output_dir)
+        tokenizer.save_pretrained(args.output_dir)
+        logger.info("Training complete. Checkpoint saved to %s", args.output_dir)
+    finally:
+        sys.stdout = original_stdout
+        sys.stderr = original_stderr
+        if log_file is not None:
+            log_file.flush()
+            log_file.close()
 
 
 if __name__ == "__main__":
