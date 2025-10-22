@@ -462,7 +462,12 @@ class Qwen2Model(Qwen2PreTrainedModel):
         modified_input_ids_list = []
         beacon_positions_list = []
         modified_labels_list = [] if labels is not None else None
-        
+        pad_token_id = self.config.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = self.config.eos_token_id
+        if pad_token_id is None:
+            pad_token_id = 0
+
         for batch_idx in range(batch_size):
             ids = input_ids[batch_idx].tolist()
             label_row = labels[batch_idx].tolist() if labels is not None else None
@@ -545,7 +550,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
         for index, (ids, beacon_pos) in enumerate(zip(modified_input_ids_list, beacon_positions_list)):
             # padding
             pad_len = max_len - len(ids)
-            padded_ids = ids + [self.config.pad_token_id] * pad_len
+            padded_ids = ids + [pad_token_id] * pad_len
             padded_pos = beacon_pos + [0] * pad_len
             
             padded_input_ids.append(padded_ids)
