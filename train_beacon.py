@@ -13,7 +13,7 @@ import numpy as np
 import math
 
 import torch
-from datasets import DatasetDict, load_dataset, load_from_disk
+from datasets import DatasetDict, load_dataset, load_from_disk, concatenate_datasets
 from transformers import AutoTokenizer, Trainer, TrainingArguments
 
 from modeling_qwen2 import Qwen2ForCausalLM
@@ -27,10 +27,18 @@ ALLOWED_ROLES = {"system", "user", "assistant"}
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Fine-tune Qwen2 beacon projections on multi-turn chat data.")
     parser.add_argument(
+        "--data-paths",
+        type=str,
+        nargs='+',  # 接受多个参数
+        default=["lmsys-chat-turn-ge-3.jsonl"],
+        help="Paths to JSONL files that store multi-turn conversations. Can specify multiple files separated by spaces.",
+    )
+    # 保持旧的兼容性
+    parser.add_argument(
         "--data-path",
         type=str,
-        default="lmsys-chat-turn-ge-3.jsonl",
-        help="Path to the JSONL file that stores multi-turn conversations.",
+        default=None,
+        help="Path to the JSONL file that stores multi-turn conversations. (Deprecated: Use --data-paths instead)",
     )
     parser.add_argument(
         "--model-path",
@@ -194,7 +202,7 @@ def build_messages(turns: List[Dict[str, Any]], system_prompt: str) -> List[Dict
 
 
 def prepare_dataset(
-    data_path: str,
+    data_paths: List[str],
     tokenizer,
     max_length: int,
     system_prompt: str,
@@ -213,8 +221,18 @@ def prepare_dataset(
             eval_dataset = None
         return train_dataset, eval_dataset
 
-    dataset = load_dataset("json", data_files=data_path, split="train")
-    logger.info("Loaded %d raw conversations", len(dataset))
+    # 加载多个数据集并连接
+    logger.info("Loading %d dataset files", len(data_paths))
+    datasets = []
+    for data_path in data_paths:
+        logger.info("Loading dataset from %s", data_path)
+        dataset = load_dataset("json", data_files=data_path, split="train")
+        logger.info("Loaded %d raw conversations from %s", len(dataset), data_path)
+        datasets.append(dataset)
+    
+    # 连接所有数据集
+    dataset = concatenate_datasets(datasets)
+    logger.info("Combined dataset has %d raw conversations", len(dataset))
 
     newline_token_ids = tokenizer("\n", add_special_tokens=False)["input_ids"]
     newline_token_id = newline_token_ids[-1] if newline_token_ids else None
@@ -453,6 +471,15 @@ class BeaconDataCollator:
 def main() -> None:
     args = parse_args()
 
+    # 处理新旧参数兼容性
+    if args.data_path is not None:
+        # 如果使用了旧参数，则只使用旧参数
+        data_paths = [args.data_path]
+        logger.warning("Using deprecated --data-path argument. Consider using --data-paths instead.")
+    else:
+        # 否则使用新参数
+        data_paths = args.data_paths
+
     os.makedirs(args.output_dir, exist_ok=True)
     logging_dir = os.path.join(args.output_dir, "logs")
     os.makedirs(logging_dir, exist_ok=True)
@@ -486,7 +513,7 @@ def main() -> None:
         tokenizer.padding_side = "right"
 
         train_dataset, eval_dataset = prepare_dataset(
-            data_path=args.data_path,
+            data_paths=data_paths,
             tokenizer=tokenizer,
             max_length=args.max_length,
             system_prompt=args.system_prompt,

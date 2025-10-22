@@ -501,11 +501,14 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 # 在每个QA轮次结束后添加beacon token，但排除system段落和最后一个段落
                 # system段落不应该被压缩，最后一个段落是当前轮次
                 if i < len(pairs) - 1 and role_type != "system":
-                    modified_ids.append(self.beacon_token_id)
-                    beacon_pos.append(1)  # 标记这是beacon token位置
+                    # 改为插入两个beacon token以增加信息容量
+                    for _ in range(2):
+                        modified_ids.append(self.beacon_token_id)
+                        beacon_pos.append(1)  # 标记这是beacon token位置
+                        if labels is not None and modified_label_ids is not None:
+                            modified_label_ids.append(-100)  # beacon位置不参与loss
+                    
                     segments.append((current_pos, len(modified_ids) - 1))  # 记录这个QA段落的范围
-                    if labels is not None and modified_label_ids is not None:
-                        modified_label_ids.append(-100)  # beacon位置不参与loss
                 
                 current_pos = end_pos + 1
             

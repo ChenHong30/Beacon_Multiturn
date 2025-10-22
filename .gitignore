@@ -3,3 +3,5 @@ Qwen2-0.5B-Instruct
 AGENTS.md
 runs
 *.jsonl
+*.json
+convert_orca_to_beacon_format.py
