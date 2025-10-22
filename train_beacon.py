@@ -223,15 +223,16 @@ def prepare_dataset(
 
     # 加载多个数据集并连接
     logger.info("Loading %d dataset files", len(data_paths))
-    datasets = []
+    all_conversations = []
+    
     for data_path in data_paths:
         logger.info("Loading dataset from %s", data_path)
         dataset = load_dataset("json", data_files=data_path, split="train")
         logger.info("Loaded %d raw conversations from %s", len(dataset), data_path)
         
-        # 标准化数据集特征，只保留必要的字段以确保一致性
-        def standardize_features(example):
-            # 确保只保留conversation字段，其中每个turn只包含role和content
+        # 直接提取conversation字段的值，跳过schema问题
+        for example in dataset:
+            # 标准化对话数据
             standard_conv = []
             for turn in example["conversation"]:
                 standard_turn = {
@@ -239,13 +240,11 @@ def prepare_dataset(
                     "content": turn.get("content", "")
                 }
                 standard_conv.append(standard_turn)
-            return {"conversation": standard_conv}
-        
-        dataset = dataset.map(standardize_features, desc="Standardizing features")
-        datasets.append(dataset)
+            all_conversations.append({"conversation": standard_conv})
     
-    # 连接所有数据集
-    dataset = concatenate_datasets(datasets)
+    # 创建标准格式的新数据集
+    from datasets import Dataset
+    dataset = Dataset.from_list(all_conversations)
     logger.info("Combined dataset has %d raw conversations", len(dataset))
 
     newline_token_ids = tokenizer("\n", add_special_tokens=False)["input_ids"]
