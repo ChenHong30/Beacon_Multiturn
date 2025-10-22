@@ -228,6 +228,20 @@ def prepare_dataset(
         logger.info("Loading dataset from %s", data_path)
         dataset = load_dataset("json", data_files=data_path, split="train")
         logger.info("Loaded %d raw conversations from %s", len(dataset), data_path)
+        
+        # 标准化数据集特征，只保留必要的字段以确保一致性
+        def standardize_features(example):
+            # 确保只保留conversation字段，其中每个turn只包含role和content
+            standard_conv = []
+            for turn in example["conversation"]:
+                standard_turn = {
+                    "role": turn.get("role", ""),
+                    "content": turn.get("content", "")
+                }
+                standard_conv.append(standard_turn)
+            return {"conversation": standard_conv}
+        
+        dataset = dataset.map(standardize_features, desc="Standardizing features")
         datasets.append(dataset)
     
     # 连接所有数据集
