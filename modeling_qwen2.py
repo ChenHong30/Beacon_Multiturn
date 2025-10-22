@@ -399,35 +399,44 @@ class Qwen2Model(Qwen2PreTrainedModel):
         self.user_id = 872         # user
         self.assistant_id = 77091  # assistant
         
-        # 添加beacon token到词汇表（使用一个未使用的token ID）
-        self.beacon_token_id = self.vocab_size  # 使用词汇表大小作为beacon token ID
+        # 添加beacon tokens到词汇表（使用两个未使用的token ID）
+        self.beacon_token_ids: list[int] = [self.vocab_size, self.vocab_size + 1]
+        # 向后兼容单个ID的访问方式，默认返回第一个beacon token
+        self.beacon_token_id = self.beacon_token_ids[0]
 
         # Initialize weights and apply final processing
         self.post_init()
     
     def extend_embeddings_for_beacon(self):
         """
-        扩展embedding层以包含beacon token，在加载预训练权重后调用
+        扩展embedding层以包含beacon tokens，在加载预训练权重后调用
         """
         original_vocab_size = self.embed_tokens.num_embeddings
-        if original_vocab_size <= self.beacon_token_id:
+        last_beacon_id = self.beacon_token_ids[-1]
+        if original_vocab_size <= last_beacon_id:
             # 扩展embedding层
-            new_embeddings = nn.Embedding(self.beacon_token_id + 1, self.config.hidden_size, self.padding_idx)
+            new_embeddings = nn.Embedding(last_beacon_id + 1, self.config.hidden_size, self.padding_idx)
             # 复制原有的权重并保持数据类型一致
             with torch.no_grad():
                 new_embeddings.weight[:original_vocab_size] = self.embed_tokens.weight
-                # 随机初始化beacon token的embedding，保持与原权重相同的数据类型
-                beacon_init = torch.normal(mean=0.0, std=self.config.initializer_range, 
-                                         size=(1, self.config.hidden_size), 
-                                         dtype=self.embed_tokens.weight.dtype, 
-                                         device=self.embed_tokens.weight.device)
-                new_embeddings.weight[self.beacon_token_id] = beacon_init.squeeze(0)
-            
+                # 随机初始化新的beacon token embedding，保持与原权重相同的数据类型
+                for beacon_id in self.beacon_token_ids:
+                    if beacon_id < original_vocab_size:
+                        continue
+                    beacon_init = torch.normal(
+                        mean=0.0,
+                        std=self.config.initializer_range,
+                        size=(self.config.hidden_size,),
+                        dtype=self.embed_tokens.weight.dtype,
+                        device=self.embed_tokens.weight.device,
+                    )
+                    new_embeddings.weight[beacon_id] = beacon_init
+
             # 确保新embedding层的数据类型与原来一致
             new_embeddings = new_embeddings.to(dtype=self.embed_tokens.weight.dtype, device=self.embed_tokens.weight.device)
             self.embed_tokens = new_embeddings
             # 更新vocab_size
-            self.vocab_size = self.beacon_token_id + 1
+            self.vocab_size = last_beacon_id + 1
             self.config.vocab_size = self.vocab_size
 
     def get_input_embeddings(self):
@@ -440,12 +449,12 @@ class Qwen2Model(Qwen2PreTrainedModel):
         self, input_ids: torch.Tensor, labels: Optional[torch.Tensor] = None
     ) -> tuple[list, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """
-        解析多轮对话序列，识别每个QA轮次，并在每个轮次末尾添加beacon token
+        解析多轮对话序列，识别每个QA轮次，并在每个轮次末尾添加两个beacon tokens
         
         Returns:
             qa_segments: 每个QA轮次的起始和结束位置列表
-            modified_input_ids: 添加了beacon token的input_ids
-            beacon_positions: beacon token的位置mask
+            modified_input_ids: 添加了beacon tokens的input_ids
+            beacon_positions: beacon tokens的位置mask
             modified_labels: 若提供labels，则返回与modified_input_ids对齐的labels（beacon位置填充为-100）
         """
         batch_size, seq_len = input_ids.shape
@@ -498,14 +507,16 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 elif self.assistant_id in segment_content:
                     role_type = "assistant"
                 
-                # 在每个QA轮次结束后添加beacon token，但排除system段落和最后一个段落
+                # 在每个QA轮次结束后添加两个beacon tokens，但排除system段落和最后一个段落
                 # system段落不应该被压缩，最后一个段落是当前轮次
                 if i < len(pairs) - 1 and role_type != "system":
-                    modified_ids.append(self.beacon_token_id)
-                    beacon_pos.append(1)  # 标记这是beacon token位置
+                    for beacon_id in self.beacon_token_ids:
+                        modified_ids.append(beacon_id)
+                        beacon_pos.append(1)  # 标记这是beacon token位置
                     segments.append((current_pos, len(modified_ids) - 1))  # 记录这个QA段落的范围
                     if labels is not None and modified_label_ids is not None:
-                        modified_label_ids.append(-100)  # beacon位置不参与loss
+                        for _ in self.beacon_token_ids:
+                            modified_label_ids.append(-100)  # beacon位置不参与loss
                 
                 current_pos = end_pos + 1
             
@@ -629,14 +640,14 @@ class Qwen2Model(Qwen2PreTrainedModel):
         if not isinstance(past_key_values, (type(None), Cache)):
             raise ValueError("The `past_key_values` should be either a `Cache` object or `None`.")
 
-        # 多轮对话解析和beacon token处理
+        # 多轮对话解析和beacon tokens处理
         beacon_positions = None
         qa_segments = None
         
         # 只在预填充阶段（past_key_values为None）进行beacon压缩
         if (input_ids is not None and enable_beacon_compression and 
             past_key_values is None):
-            # 解析多轮对话并添加beacon token
+            # 解析多轮对话并添加beacon tokens
             qa_segments, modified_input_ids, beacon_positions, modified_labels = self.parse_multiturn_dialogue(
                 input_ids, labels
             )
@@ -646,7 +657,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 input_ids = modified_input_ids
                 if modified_labels is not None:
                     labels = modified_labels
-                # print(f"预填充阶段：检测到多轮对话，添加了 {torch.sum(beacon_positions).item()} 个beacon token")
+                # print(f"预填充阶段：检测到多轮对话，添加了 {torch.sum(beacon_positions).item()} 个beacon tokens")
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
@@ -662,7 +673,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
             
-        # 如果添加了beacon token，需要调整position_ids和cache_position以匹配新的序列长度
+        # 如果添加了beacon tokens，需要调整position_ids和cache_position以匹配新的序列长度
         if beacon_positions is not None and torch.any(beacon_positions):
             # 确保position_ids和cache_position的长度与inputs_embeds匹配
             if position_ids.shape[1] != inputs_embeds.shape[1]:
