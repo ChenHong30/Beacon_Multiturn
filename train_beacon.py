@@ -14,7 +14,7 @@ import math
 
 import torch
 from datasets import DatasetDict, load_dataset, load_from_disk, concatenate_datasets
-from transformers import AutoTokenizer, Trainer, TrainingArguments
+from transformers import AutoTokenizer, Trainer, TrainingArguments, TrainerCallback
 
 from modeling_qwen2 import Qwen2ForCausalLM
 
@@ -22,6 +22,16 @@ logger = logging.getLogger(__name__)
 
 
 ALLOWED_ROLES = {"system", "user", "assistant"}
+
+
+def sanitize_for_json(obj: Any) -> Any:
+    if isinstance(obj, (str, int, float, bool)) or obj is None:
+        return obj
+    if isinstance(obj, dict):
+        return {str(key): sanitize_for_json(value) for key, value in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [sanitize_for_json(value) for value in obj]
+    return str(obj)
 
 
 def parse_args() -> argparse.Namespace:
@@ -427,6 +437,88 @@ class Tee:
         self.log_file.flush()
 
 
+class JsonMetricsCallback(TrainerCallback):
+    """
+    Records training metrics into a JSON file every time the Trainer logs.
+    """
+
+    def __init__(self, json_path: str, params: Dict[str, Any]):
+        self.json_path = json_path
+        self.data: Dict[str, Any] = {
+            "params": params,
+            "metrics": [],
+        }
+
+    def on_log(self, args, state, control, logs: Optional[Dict[str, float]] = None, **kwargs) -> None:
+        if not logs or "loss" not in logs:
+            return
+
+        record: Dict[str, Any] = {
+            "step": state.global_step,
+            "epoch": state.epoch,
+        }
+        for key in ("loss", "learning_rate", "grad_norm"):
+            if key in logs:
+                record[key] = logs[key]
+        if record:
+            self.data["metrics"].append(record)
+            self._write()
+
+    def on_train_end(self, args, state, control, **kwargs) -> None:
+        self._write()
+
+    def _write(self) -> None:
+        os.makedirs(os.path.dirname(self.json_path), exist_ok=True)
+        with open(self.json_path, "w", encoding="utf-8") as json_file:
+            json.dump(self.data, json_file, ensure_ascii=False, indent=2)
+
+
+def generate_loss_plot(metrics_json_path: str, plot_path: str) -> None:
+    if not os.path.exists(metrics_json_path):
+        logger.warning("Metrics JSON %s not found. Skipping loss plot generation.", metrics_json_path)
+        return
+
+    try:
+        with open(metrics_json_path, "r", encoding="utf-8") as json_file:
+            payload = json.load(json_file)
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.warning("Failed to read metrics JSON %s: %s", metrics_json_path, exc)
+        return
+
+    metrics = payload.get("metrics", [])
+    steps = []
+    losses = []
+    for record in metrics:
+        step = record.get("step")
+        loss = record.get("loss")
+        if loss is None:
+            continue
+        steps.append(step if step is not None else len(steps))
+        losses.append(loss)
+
+    if not losses:
+        logger.warning("No loss entries found in %s. Skipping loss plot generation.", metrics_json_path)
+        return
+
+    try:
+        import matplotlib.pyplot as plt  # type: ignore
+    except ImportError:
+        logger.warning("matplotlib is not installed. Skipping loss plot generation.")
+        return
+
+    plt.figure(figsize=(8, 5))
+    plt.plot(steps, losses, marker="o", linestyle="-", linewidth=1.5, markersize=3)
+    plt.xlabel("Step")
+    plt.ylabel("Loss")
+    plt.title("Training Loss")
+    plt.grid(True, linestyle="--", alpha=0.3)
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(plot_path), exist_ok=True)
+    plt.savefig(plot_path)
+    plt.close()
+    logger.info("Saved loss plot to %s", plot_path)
+
+
 class BeaconDataCollator:
     """
     Pads variable-length chat examples while preserving precomputed labels.
@@ -497,6 +589,8 @@ def main() -> None:
     logging_dir = os.path.join(args.output_dir, "logs")
     os.makedirs(logging_dir, exist_ok=True)
     log_path = os.path.join(logging_dir, "training_logs.log")
+    metrics_json_path = os.path.join(logging_dir, "training_metrics.json")
+    loss_plot_path = os.path.join(logging_dir, "loss_curve.png")
 
     original_stdout = sys.stdout
     original_stderr = sys.stderr
@@ -597,6 +691,12 @@ def main() -> None:
 
         training_args = TrainingArguments(**training_kwargs)
 
+        params_for_json = {
+            "cli_args": sanitize_for_json(vars(args)),
+            "training_arguments": sanitize_for_json(training_args.to_dict()),
+        }
+        metrics_callback = JsonMetricsCallback(metrics_json_path, params_for_json)
+
         trainer = Trainer(
             model=model,
             args=training_args,
@@ -605,6 +705,7 @@ def main() -> None:
             data_collator=data_collator,
             tokenizer=tokenizer,
             compute_metrics=compute_metrics if eval_dataset is not None else None,
+            callbacks=[metrics_callback],
         )
 
         trainer.train()
@@ -612,6 +713,7 @@ def main() -> None:
         trainer.save_model(args.output_dir)
         tokenizer.save_pretrained(args.output_dir)
         logger.info("Training complete. Checkpoint saved to %s", args.output_dir)
+        generate_loss_plot(metrics_json_path, loss_plot_path)
     finally:
         sys.stdout = original_stdout
         sys.stderr = original_stderr
