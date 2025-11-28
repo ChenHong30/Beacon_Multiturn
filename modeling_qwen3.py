@@ -877,10 +877,11 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
         hidden_states = self.norm(hidden_states)
         
-        # 在预填充阶段完成后，压缩KV cache（只保留beacon token的KV）
-        # 只在预填充阶段且检测到beacon token时进行压缩
-        if (use_cache and beacon_positions is not None and torch.any(beacon_positions) and
-            past_key_values is not None):
+        # 维护KV cache压缩（只保留beacon token的KV）
+        # 在预填充完成后或生成阶段，当beacon压缩启用且存在beacon位置时进行压缩
+        # 重要：beacon_positions在prefill阶段生成后，在生成阶段会持续用于KV压缩
+        if (use_cache and enable_beacon_compression and beacon_positions is not None and 
+            torch.any(beacon_positions) and past_key_values is not None and past_key_values.get_seq_length() > 0):
             past_key_values = self.compress_kv_cache(past_key_values, beacon_positions)
             
         outputs = BaseModelOutputWithPast(
@@ -1020,10 +1021,16 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         
-        # 在生成阶段（past_key_values不为None）禁用beacon压缩
-        # 只在预填充阶段启用beacon压缩
+        # 在生成阶段保持beacon压缩启用，以维持压缩的KV缓存
+        # 但在生成阶段不会添加新的beacon token，只维护现有的beacon状态
+        # Only disable beacon compression during generation if we don't want to maintain compressed cache
+        # For memory efficiency, we should keep beacon compression on to maintain compressed KV cache
+        # However, during generation (when past_key_values is not None), we should not add new beacon tokens
+        # The compression logic will only maintain existing beacon positions
         if past_key_values is not None:
-            enable_beacon_compression = False
+            # During generation, we maintain the compressed beacon cache but don't add new beacon tokens
+            # The beacon_positions will remain as they were from prefill, ensuring we only keep beacon KV states
+            pass  # Keep enable_beacon_compression as is to maintain compressed cache
             
         outputs: BaseModelOutputWithPast = self.model(
             input_ids=input_ids,
