@@ -14,9 +14,10 @@ import math
 
 import torch
 from datasets import DatasetDict, load_dataset, load_from_disk, concatenate_datasets
-from transformers import AutoTokenizer, Trainer, TrainingArguments, TrainerCallback
+from transformers import AutoTokenizer, Trainer, TrainingArguments, TrainerCallback, AutoConfig
 
 from modeling_qwen2 import Qwen2ForCausalLM
+from modeling_qwen3 import Qwen3ForCausalLM
 
 logger = logging.getLogger(__name__)
 
@@ -373,16 +374,16 @@ def prepare_dataset(
     return train_dataset, eval_dataset
 
 
-def freeze_non_beacon_parameters(model: Qwen2ForCausalLM, train_lm_head: bool) -> None:
-    beacon_keywords = {"beacon_q_proj", "beacon_k_proj", "beacon_v_proj"}
+def freeze_non_beacon_parameters(model, train_lm_head: bool) -> None:
     trainable = 0
     frozen = 0
 
     for name, param in model.named_parameters():
-        keep_trainable = any(keyword in name for keyword in beacon_keywords)
+        # 只要参数名包含 "beacon"，就允许训练 (包括 proj, norm, embedding 等)
+        keep_trainable = "beacon" in name
 
         if not keep_trainable and "embed_tokens" in name:
-            keep_trainable = True  # allow beacon embedding to update
+            keep_trainable = True  # allow beacon embedding to update (via full embedding matrix)
         if not keep_trainable and train_lm_head and "lm_head" in name:
             keep_trainable = True
 
@@ -629,7 +630,19 @@ def main() -> None:
             processed_cache_dir=args.processed_cache_dir,
         )
 
-        model = Qwen2ForCausalLM.from_pretrained(
+        config = AutoConfig.from_pretrained(args.model_path, trust_remote_code=True)
+        
+        if config.model_type == "qwen2":
+            model_cls = Qwen2ForCausalLM
+            logger.info("Detected Qwen2 architecture. Using Qwen2ForCausalLM.")
+        elif config.model_type == "qwen3":
+            model_cls = Qwen3ForCausalLM
+            logger.info("Detected Qwen3 architecture. Using Qwen3ForCausalLM.")
+        else:
+            logger.warning(f"Unknown model type: {config.model_type}. Defaulting to Qwen2ForCausalLM.")
+            model_cls = Qwen2ForCausalLM
+
+        model = model_cls.from_pretrained(
             args.model_path,
             torch_dtype=torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else None),
             device_map="auto" if torch.cuda.is_available() else None,
