@@ -462,11 +462,11 @@ class Qwen3Model(Qwen3PreTrainedModel):
         self.has_sliding_layers = "sliding_attention" in self.config.layer_types
         
         # 多轮对话相关的特殊token ID
-        self.im_start_id = 151644  # <|im_start|>
-        self.im_end_id = 151645    # <|im_end|>
-        self.system_id = 8948      # system
-        self.user_id = 872         # user
-        self.assistant_id = 77091  # assistant
+        self.im_start_id = getattr(config, "im_start_token_id", 151644)
+        self.im_end_id = getattr(config, "im_end_token_id", 151645)
+        self.system_id = getattr(config, "system_token_id", 8948)
+        self.user_id = getattr(config, "user_token_id", 872)
+        self.assistant_id = getattr(config, "assistant_token_id", 77091)
         
         # 添加beacon token到词汇表（使用一个未使用的token ID）
         self.beacon_token_id = self.vocab_size  # 使用词汇表大小作为beacon token ID
@@ -858,7 +858,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
                             # 同步更新sliding window mask (如果存在)
                             if "sliding_attention" in causal_mask_mapping and causal_mask_mapping["sliding_attention"] is not None:
                                 causal_mask_mapping["sliding_attention"][b, 0, end_i + 1:, start_i : end_i] = min_val
-
+        
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
