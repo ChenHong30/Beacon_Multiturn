@@ -670,15 +670,17 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
         return qa_segments, modified_input_ids, beacon_positions, modified_labels_tensor
 
-    def compress_kv_cache(self, past_key_values: Cache, beacon_positions: torch.Tensor) -> Cache:
+    def compress_kv_cache(
+        self, past_key_values: Cache, beacon_positions: torch.Tensor, qa_segments: list = None
+    ) -> Cache:
         """
-        压缩KV cache，保留beacon token的KV + 当前轮次(最后一个beacon之后)的所有token。
+        压缩KV cache，保留 System + beacon tokens + 当前轮次的所有token。
 
         压缩逻辑：
         - 输入: System + Q1 + A1 + B1 + Q2 + A2 + B2 + Q3 (当前query)
-        - 输出: B1 + B2 + Q3
+        - 输出: System + B1 + B2 + Q3
         - 历史轮次的body (Q1, A1, Q2, A2) 被丢弃，只保留其beacon表示
-        - 当前轮次Q3完整保留
+        - System和当前轮次Q3完整保留
 
         支持Batch > 1，会自动处理不同样本长度不一致的情况（进行padding）。
         """
@@ -701,8 +703,10 @@ class Qwen3Model(Qwen3PreTrainedModel):
         dtype = key_cache_list[0].dtype
         kv_seq_len = key_cache_list[0].shape[2]
 
-        # 1. 计算每个样本需要保留的索引：beacon positions + 最后一个beacon之后的所有位置
+        # 1. 计算每个样本需要保留的索引：System + beacon positions + 当前轮次
         batch_keep_indices = []
+        batch_system_ends = []  # 保存每个batch的system_end，用于RoPE修正
+        batch_num_beacons = []  # 保存每个batch的beacon数量
         max_keep_len = 0
 
         for b in range(batch_size):
@@ -713,23 +717,40 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 beacon_indices = beacon_indices.unsqueeze(0)
 
             if len(beacon_indices) > 0:
+                # === 修复：保留System tokens ===
+                # System范围：从0到第一个历史segment的开始位置之前
+                # 通过qa_segments获取第一个历史segment的开始位置
+                system_end = 0  # 默认没有system
+                if qa_segments is not None and len(qa_segments) > b and len(qa_segments[b]) > 0:
+                    first_segment_start = qa_segments[b][0][0]  # 第一个segment的开始位置
+                    system_end = first_segment_start  # system是0到first_segment_start-1
+
+                if system_end > 0:
+                    system_indices = torch.arange(0, system_end, device=device)
+                else:
+                    system_indices = torch.tensor([], dtype=torch.long, device=device)
+
                 # 最后一个beacon的位置
                 last_beacon_pos = beacon_indices[-1].item()
                 # 当前轮次的范围：最后一个beacon之后到序列末尾
-                # 注意：kv_seq_len可能和beacon_positions的seq_len不同（如果有padding）
                 current_turn_start = last_beacon_pos + 1
                 current_turn_end = min(seq_len, kv_seq_len)
 
                 # 当前轮次的索引
                 if current_turn_start < current_turn_end:
                     current_turn_indices = torch.arange(current_turn_start, current_turn_end, device=device)
-                    # 合并：beacon indices + current turn indices
-                    keep_indices = torch.cat([beacon_indices, current_turn_indices])
+                    # 合并：System + beacon indices + current turn indices
+                    keep_indices = torch.cat([system_indices, beacon_indices, current_turn_indices])
                 else:
-                    keep_indices = beacon_indices
+                    keep_indices = torch.cat([system_indices, beacon_indices])
+
+                batch_system_ends.append(system_end)
+                batch_num_beacons.append(len(beacon_indices))
             else:
                 # 没有beacon，保留所有（不压缩）
                 keep_indices = torch.arange(min(seq_len, kv_seq_len), device=device)
+                batch_system_ends.append(0)
+                batch_num_beacons.append(0)
 
             batch_keep_indices.append(keep_indices)
             max_keep_len = max(max_keep_len, len(keep_indices))
@@ -754,19 +775,40 @@ class Qwen3Model(Qwen3PreTrainedModel):
             for b in range(batch_size):
                 keep_indices = batch_keep_indices[b]
                 keep_count = len(keep_indices)
+                system_end = batch_system_ends[b]
+                num_beacons = batch_num_beacons[b]
 
                 if keep_count > 0:
                     # 提取需要保留的KV
                     k_chunk = original_key[b, :, keep_indices, :]  # [num_heads, keep_count, head_dim]
                     v_chunk = original_value[b, :, keep_indices, :]
 
-                    # === RoPE 修正逻辑 ===
-                    # 将保留的token重新映射到连续位置 0, 1, 2, ...
-                    target_pos = torch.arange(keep_count, device=device)
+                    # === RoPE 修正逻辑（与训练时的位置映射一致）===
+                    # 目标位置分配：
+                    # - System tokens (前system_end个): 保持0, 1, ..., system_end-1
+                    # - Beacon tokens (接下来num_beacons个): system_end, system_end+1, ...
+                    # - Current turn tokens (剩余): system_end+num_beacons, system_end+num_beacons+1, ...
+                    target_pos = torch.zeros(keep_count, dtype=torch.long, device=device)
+
+                    # System部分：保持原位置
+                    for i in range(system_end):
+                        target_pos[i] = i
+
+                    # Beacon部分
+                    for i in range(num_beacons):
+                        target_pos[system_end + i] = system_end + i
+
+                    # Current turn部分
+                    current_turn_count = keep_count - system_end - num_beacons
+                    current_turn_new_start = system_end + num_beacons
+                    for i in range(current_turn_count):
+                        target_pos[system_end + num_beacons + i] = current_turn_new_start + i
+
                     delta = target_pos - keep_indices
 
                     # DEBUG: 打印RoPE修正信息（只在第一层打印）
                     if layer_idx == 0 and b == 0:
+                        print(f"\033[93m[DEBUG RoPE] system_end: {system_end}, num_beacons: {num_beacons}\033[0m")
                         print(f"\033[93m[DEBUG RoPE] Original positions (first 5): {keep_indices[:5].tolist()}\033[0m")
                         print(f"\033[93m[DEBUG RoPE] Target positions (first 5): {target_pos[:5].tolist()}\033[0m")
                         print(f"\033[93m[DEBUG RoPE] Delta (first 5): {delta[:5].tolist()}\033[0m")
@@ -968,7 +1010,78 @@ class Qwen3Model(Qwen3PreTrainedModel):
                             # 同步更新sliding window mask (如果存在)
                             if "sliding_attention" in causal_mask_mapping and causal_mask_mapping["sliding_attention"] is not None:
                                 causal_mask_mapping["sliding_attention"][b, 0, end_i + 1:, start_i : end_i] = min_val
-        
+
+        # === 方案1核心：训练时模拟压缩后的位置配置 ===
+        # 当有beacon时，重新计算position_ids使其模拟压缩后的位置分布
+        # 这样训练和推理时的相对位置关系保持一致
+        if qa_segments is not None and beacon_positions is not None and torch.any(beacon_positions):
+            batch_size = inputs_embeds.shape[0]
+            seq_len = inputs_embeds.shape[1]
+            device = inputs_embeds.device
+
+            # 为每个batch计算新的position_ids
+            new_position_ids_list = []
+            for b in range(batch_size):
+                if len(qa_segments) > b and len(qa_segments[b]) > 0:
+                    # 获取system的结束位置（第一个历史segment的开始位置）
+                    system_end = qa_segments[b][0][0]
+
+                    # 获取beacon位置
+                    beacon_indices = torch.nonzero(beacon_positions[b], as_tuple=False).squeeze(-1)
+                    if beacon_indices.dim() == 0:
+                        beacon_indices = beacon_indices.unsqueeze(0)
+                    num_beacons = len(beacon_indices)
+
+                    # 获取当前轮次的开始位置（最后一个beacon之后）
+                    if num_beacons > 0:
+                        current_turn_start = beacon_indices[-1].item() + 1
+                    else:
+                        current_turn_start = system_end
+
+                    # 创建新的position_ids映射
+                    # 原始位置 -> 压缩后位置
+                    new_pos = torch.zeros(seq_len, dtype=torch.long, device=device)
+
+                    # System tokens: 保持原位置 0, 1, ..., system_end-1
+                    for i in range(system_end):
+                        new_pos[i] = i
+
+                    # Beacon tokens: 紧接system之后 system_end, system_end+1, ...
+                    for idx, beacon_pos in enumerate(beacon_indices.tolist()):
+                        new_pos[beacon_pos] = system_end + idx
+
+                    # 当前轮次: 紧接beacons之后
+                    current_turn_new_start = system_end + num_beacons
+                    for i, orig_pos in enumerate(range(current_turn_start, seq_len)):
+                        new_pos[orig_pos] = current_turn_new_start + i
+
+                    # 历史body位置（被mask掉的）：给一个合理的位置，虽然它们会被mask
+                    # 使用它们原来在各自segment中的相对位置
+                    for seg_idx, (seg_start, beacon_pos) in enumerate(qa_segments[b]):
+                        # segment body从seg_start到beacon_pos-1
+                        for i, orig_pos in enumerate(range(seg_start, beacon_pos)):
+                            # 历史body可以用原始位置，因为它们会被attention mask遮蔽
+                            # 但为了一致性，也可以映射到beacon附近
+                            new_pos[orig_pos] = system_end + seg_idx  # 和对应beacon相同位置
+
+                    new_position_ids_list.append(new_pos)
+                else:
+                    # 没有qa_segments，保持原始位置
+                    new_position_ids_list.append(torch.arange(seq_len, dtype=torch.long, device=device))
+
+            # 组合成batch
+            position_ids = torch.stack(new_position_ids_list, dim=0)
+            cache_position = position_ids[0]  # cache_position取第一个batch的
+
+            # DEBUG: 打印位置重映射信息
+            if batch_size > 0 and len(qa_segments) > 0 and len(qa_segments[0]) > 0:
+                print(f"\033[96m[DEBUG Position Remap] Original seq_len: {seq_len}\033[0m")
+                print(f"\033[96m[DEBUG Position Remap] system_end: {qa_segments[0][0][0]}, num_beacons: {beacon_positions[0].sum().item()}\033[0m")
+                print(f"\033[96m[DEBUG Position Remap] New position_ids (first 15): {position_ids[0][:15].tolist()}\033[0m")
+                beacon_idx = torch.nonzero(beacon_positions[0], as_tuple=False).squeeze(-1)
+                if beacon_idx.numel() > 0:
+                    print(f"\033[96m[DEBUG Position Remap] Beacon positions: {beacon_idx.tolist()}, their new pos: {[position_ids[0][i].item() for i in beacon_idx.tolist()]}\033[0m")
+
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
@@ -998,7 +1111,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
         if (use_cache and enable_beacon_compression and beacon_positions is not None and
             torch.any(beacon_positions) and past_key_values is not None and past_key_values.get_seq_length() > 0):
-            past_key_values = self.compress_kv_cache(past_key_values, beacon_positions)
+            past_key_values = self.compress_kv_cache(past_key_values, beacon_positions, qa_segments)
             
         outputs = BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
