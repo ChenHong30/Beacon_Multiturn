@@ -467,35 +467,28 @@ class Qwen3Model(Qwen3PreTrainedModel):
         self.system_id = getattr(config, "system_token_id", 8948)
         self.user_id = getattr(config, "user_token_id", 872)
         self.assistant_id = getattr(config, "assistant_token_id", 77091)
-        
-        # 添加beacon token到词汇表（使用一个未使用的token ID）
-        self.beacon_token_id = self.vocab_size  # 使用词汇表大小作为beacon token ID
+
+        # Beacon token 使用独立的 embedding，不扩展词表
+        # 使用 vocab_size 作为标识符，但实际 embedding 来自独立参数
+        self.beacon_token_id = self.vocab_size
+        self.beacon_embedding = nn.Parameter(torch.empty(config.hidden_size))
+
+        # 用于记录压缩后的 KV cache 长度，供生成阶段使用
+        self._compressed_seq_length = None
 
         # Initialize weights and apply final processing
         self.post_init()
 
     def extend_embeddings_for_beacon(self):
         """
-        扩展embedding层以包含beacon token，在加载预训练权重后调用
+        初始化 beacon_embedding 参数，在加载预训练权重后调用。
+        使用 <|im_end|> 的 embedding 作为初始值。
         """
-        original_vocab_size = self.embed_tokens.num_embeddings
-        if original_vocab_size <= self.beacon_token_id:
-            # 扩展embedding层
-            new_embeddings = nn.Embedding(self.beacon_token_id + 1, self.config.hidden_size, self.padding_idx)
-            # 复制原有的权重并保持数据类型一致
-            with torch.no_grad():
-                new_embeddings.weight[:original_vocab_size] = self.embed_tokens.weight
-                # 使用 <|im_end|> 的embedding初始化beacon token
-                # 这样模型会将其视为一个结构化的结束/总结信号，而不是随机噪声
-                im_end_embedding = self.embed_tokens.weight[self.im_end_id]
-                new_embeddings.weight[self.beacon_token_id] = im_end_embedding
-            
-            # 确保新embedding层的数据类型与原来一致
-            new_embeddings = new_embeddings.to(dtype=self.embed_tokens.weight.dtype, device=self.embed_tokens.weight.device)
-            self.embed_tokens = new_embeddings
-            # 更新vocab_size
-            self.vocab_size = self.beacon_token_id + 1
-            self.config.vocab_size = self.vocab_size
+        with torch.no_grad():
+            # 使用 <|im_end|> 的 embedding 初始化 beacon_embedding
+            # 这样模型会将其视为一个结构化的结束/总结信号
+            im_end_embedding = self.embed_tokens.weight[self.im_end_id]
+            self.beacon_embedding.copy_(im_end_embedding)
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -791,6 +784,9 @@ class Qwen3Model(Qwen3PreTrainedModel):
         num_beacons = beacon_positions.sum().item()
         # print(f"\033[92m[DEBUG compress_kv_cache] KV cache: {original_len} -> {compressed_len} tokens (beacons: {num_beacons}, current_turn: {compressed_len - num_beacons})\033[0m")
 
+        # 保存压缩后的长度，供生成阶段使用
+        self._compressed_seq_length = compressed_len
+
         return compressed_cache
 
     @check_model_inputs()
@@ -852,7 +848,18 @@ class Qwen3Model(Qwen3PreTrainedModel):
                     labels = modified_labels
 
         if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
+            # 处理 beacon token 的 embedding
+            # beacon_token_id 超出词表范围，需要特殊处理
+            if beacon_positions is not None and torch.any(beacon_positions):
+                # 将 beacon_token_id 临时替换为 0，避免索引越界
+                safe_input_ids = input_ids.clone()
+                beacon_mask = (input_ids == self.beacon_token_id)
+                safe_input_ids[beacon_mask] = 0
+                inputs_embeds = self.embed_tokens(safe_input_ids)
+                # 将 beacon 位置的 embedding 替换为独立的 beacon_embedding
+                inputs_embeds[beacon_mask] = self.beacon_embedding
+            else:
+                inputs_embeds = self.embed_tokens(input_ids)
 
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache(config=self.config)
@@ -1023,7 +1030,10 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         **kwargs,
     ):
         """
-        准备生成所需的输入，确保 enable_beacon_compression 参数正确传递
+        准备生成所需的输入，确保 enable_beacon_compression 参数正确传递。
+
+        关键修复：当 KV cache 被压缩后，position_ids 需要基于压缩后的长度计算，
+        而不是基于原始 attention_mask 的长度。
         """
         # 如果有 past_key_values，说明是 decoding 阶段，只取最后一个 token
         if past_key_values is not None:
@@ -1032,8 +1042,30 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             elif input_ids.shape[1] != cache_position.shape[0]:
                 input_ids = input_ids[:, cache_position]
 
-        # 处理 position_ids
-        if attention_mask is not None and position_ids is None:
+        # === 关键修复：基于压缩后的 KV cache 长度计算 position_ids ===
+        # 检查是否有压缩后的长度信息
+        compressed_len = getattr(self.model, '_compressed_seq_length', None)
+
+        if past_key_values is not None and compressed_len is not None:
+            # 生成阶段：position_ids 应该基于压缩后的 KV cache 长度
+            # 新 token 的位置 = 压缩后长度 + 已生成的 token 数
+            kv_len = past_key_values.get_seq_length() if hasattr(past_key_values, 'get_seq_length') else 0
+            batch_size = input_ids.shape[0]
+            seq_len = input_ids.shape[1]
+
+            # 生成连续的 position_ids，从 kv_len 开始
+            position_ids = torch.arange(
+                kv_len, kv_len + seq_len,
+                dtype=torch.long, device=input_ids.device
+            ).unsqueeze(0).expand(batch_size, -1)
+
+            # 同时更新 cache_position
+            cache_position = torch.arange(
+                kv_len, kv_len + seq_len,
+                device=input_ids.device
+            )
+        elif attention_mask is not None and position_ids is None:
+            # Prefill 阶段或未压缩时，使用标准逻辑
             position_ids = attention_mask.long().cumsum(-1) - 1
             position_ids.masked_fill_(attention_mask == 0, 1)
             if past_key_values is not None:
@@ -1041,7 +1073,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                 position_ids = position_ids.clone(memory_format=torch.contiguous_format)
 
         # 处理 inputs_embeds（仅在第一次迭代使用）
-        if inputs_embeds is not None and cache_position[0] == 0:
+        if inputs_embeds is not None and cache_position is not None and cache_position[0] == 0:
             model_inputs = {"inputs_embeds": inputs_embeds, "input_ids": None}
         else:
             model_inputs = {"input_ids": input_ids.clone(memory_format=torch.contiguous_format), "inputs_embeds": None}
@@ -1055,15 +1087,23 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                 batch_size, sequence_length = model_inputs["input_ids"].shape
                 device = model_inputs["input_ids"].device
 
-            attention_mask = self.model._prepare_4d_causal_attention_mask_with_cache_position(
-                attention_mask,
-                sequence_length=sequence_length,
-                target_length=past_key_values.get_max_cache_shape(),
-                dtype=self.lm_head.weight.dtype,
-                device=device,
-                cache_position=cache_position,
-                batch_size=batch_size,
-            ) if hasattr(self.model, '_prepare_4d_causal_attention_mask_with_cache_position') else attention_mask
+            # 当 KV cache 被压缩后，需要调整 attention_mask 的长度
+            if compressed_len is not None:
+                # 创建新的 attention_mask，长度为压缩后的 KV cache 长度 + 当前 token
+                kv_len = past_key_values.get_seq_length() if hasattr(past_key_values, 'get_seq_length') else 0
+                new_mask_len = kv_len + sequence_length
+                attention_mask = torch.ones((batch_size, new_mask_len), dtype=torch.long, device=device)
+
+            if hasattr(self.model, '_prepare_4d_causal_attention_mask_with_cache_position'):
+                attention_mask = self.model._prepare_4d_causal_attention_mask_with_cache_position(
+                    attention_mask,
+                    sequence_length=sequence_length,
+                    target_length=past_key_values.get_max_cache_shape(),
+                    dtype=self.lm_head.weight.dtype,
+                    device=device,
+                    cache_position=cache_position,
+                    batch_size=batch_size,
+                )
 
         model_inputs.update(
             {
@@ -1092,43 +1132,29 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
     @classmethod
     def from_pretrained(cls, *args, **kwargs):
         """
-        重写from_pretrained方法，在加载预训练权重后扩展embedding层
+        重写from_pretrained方法，在加载预训练权重后初始化beacon相关参数
         """
         # 调用父类的from_pretrained方法
         model = super().from_pretrained(*args, **kwargs)
 
-        # 扩展embedding层以包含beacon token
+        # 初始化 beacon_embedding（用 im_end 的 embedding）
         model.model.extend_embeddings_for_beacon()
 
-        # 确保beacon投影矩阵的数据类型与模型一致
+        # 确保beacon投影矩阵和beacon_embedding的数据类型与模型一致
         target_dtype = model.model.embed_tokens.weight.dtype
         target_device = model.model.embed_tokens.weight.device
 
+        # 转换 beacon_embedding 的数据类型
+        model.model.beacon_embedding.data = model.model.beacon_embedding.data.to(
+            dtype=target_dtype, device=target_device
+        )
+
+        # 转换 beacon 投影矩阵的数据类型
         for layer in model.model.layers:
             if hasattr(layer.self_attn, 'beacon_q_proj'):
                 layer.self_attn.beacon_q_proj = layer.self_attn.beacon_q_proj.to(dtype=target_dtype, device=target_device)
                 layer.self_attn.beacon_k_proj = layer.self_attn.beacon_k_proj.to(dtype=target_dtype, device=target_device)
                 layer.self_attn.beacon_v_proj = layer.self_attn.beacon_v_proj.to(dtype=target_dtype, device=target_device)
-                
-        # 同时需要扩展lm_head以匹配新的vocab_size
-        if model.model.vocab_size > model.lm_head.out_features:
-            old_lm_head = model.lm_head
-            new_lm_head = nn.Linear(model.config.hidden_size, model.model.vocab_size, bias=False)
-
-            # 复制原有权重并保持数据类型一致
-            with torch.no_grad():
-                new_lm_head.weight[:old_lm_head.out_features] = old_lm_head.weight
-                # 使用 <|im_end|> 的权重初始化新token的输出权重
-                im_end_output_weight = old_lm_head.weight[model.model.im_end_id]
-                # 注意：lm_head的weight shape是 [vocab_size, hidden_size]
-                # 我们需要将这一行复制到新位置
-                new_lm_head.weight[old_lm_head.out_features:] = im_end_output_weight.unsqueeze(0)
-
-            # 确保新lm_head的数据类型与原来一致
-            new_lm_head = new_lm_head.to(dtype=old_lm_head.weight.dtype, device=old_lm_head.weight.device)
-            model.lm_head = new_lm_head
-            model.vocab_size = model.model.vocab_size
-            model.config.vocab_size = model.model.vocab_size
 
         return model
 

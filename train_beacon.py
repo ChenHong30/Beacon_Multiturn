@@ -383,8 +383,9 @@ def freeze_non_beacon_parameters(model, train_lm_head: bool) -> None:
         # 只要参数名包含 "beacon"，就允许训练 (包括 proj, norm, embedding 等)
         keep_trainable = "beacon" in name
 
-        if not keep_trainable and "embed_tokens" in name:
-            keep_trainable = True  # allow beacon embedding to update (via full embedding matrix)
+        # 不再解冻整个 embed_tokens，beacon_embedding 已经是独立参数
+        # 删除了: if not keep_trainable and "embed_tokens" in name: keep_trainable = True
+
         if not keep_trainable and train_lm_head and "lm_head" in name:
             keep_trainable = True
 
