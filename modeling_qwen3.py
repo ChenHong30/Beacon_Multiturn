@@ -507,7 +507,17 @@ class Qwen3Model(Qwen3PreTrainedModel):
         self, input_ids: torch.Tensor, labels: Optional[torch.Tensor] = None
     ) -> tuple[list, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """
-        解析多轮对话序列，识别每个QA轮次，并在每个轮次末尾添加beacon token
+        解析多轮对话序列，识别每个QA轮次，并在每个历史轮次末尾添加beacon token
+
+        Beacon压缩逻辑：
+        - 只压缩历史轮次，不压缩当前轮次
+        - 一个完整的轮次 = user消息 + assistant回复
+        - System消息不压缩
+        - 当前用户的问题（最后一个user消息）不压缩
+
+        例如：System + U1 + A1 + U2 + A2 + U3 (当前问题)
+        会变成：System + B1 + B2 + B3 + B4 + U3
+        其中 B1=U1的beacon, B2=A1的beacon, B3=U2的beacon, B4=A2的beacon
 
         Returns:
             qa_segments: 每个QA轮次的起始和结束位置列表
@@ -538,8 +548,38 @@ class Qwen3Model(Qwen3PreTrainedModel):
             start_positions = [i for i, token_id in enumerate(ids) if token_id == self.im_start_id]
             end_positions = [i for i, token_id in enumerate(ids) if token_id == self.im_end_id]
 
-            if len(start_positions) <= 1:
-                # 只有一个或没有对话轮次，不进行beacon处理
+            # 配对start和end位置，识别每个消息段落
+            pairs = list(zip(start_positions, end_positions))
+
+            # 分析对话结构，识别角色
+            message_roles = []
+            for start_pos, end_pos in pairs:
+                segment_tokens = ids[start_pos:end_pos + 1]
+                if self.system_id in segment_tokens:
+                    message_roles.append("system")
+                elif self.user_id in segment_tokens:
+                    message_roles.append("user")
+                elif self.assistant_id in segment_tokens:
+                    message_roles.append("assistant")
+                else:
+                    message_roles.append("unknown")
+
+            # 找到最后一个user消息的索引（这是当前轮次的问题，不应该被压缩）
+            last_user_idx = -1
+            for i in range(len(message_roles) - 1, -1, -1):
+                if message_roles[i] == "user":
+                    last_user_idx = i
+                    break
+
+            # 计算有多少个完整的历史轮次（user+assistant对）
+            # 历史轮次 = 最后一个user之前的所有非system消息
+            history_messages = []
+            for i in range(len(message_roles)):
+                if i < last_user_idx and message_roles[i] != "system":
+                    history_messages.append(i)
+
+            # 如果没有历史消息需要压缩，直接返回原始输入
+            if len(history_messages) == 0:
                 modified_input_ids_list.append(ids)
                 beacon_positions_list.append([0] * len(ids))
                 qa_segments.append([])
@@ -547,11 +587,13 @@ class Qwen3Model(Qwen3PreTrainedModel):
                     modified_labels_list.append(label_row)
                 continue
 
-            # 配对start和end位置
-            pairs = list(zip(start_positions, end_positions))
-
             current_pos = 0
             for i, (start_pos, end_pos) in enumerate(pairs):
+                role_type = message_roles[i]
+
+                # 记录当前段落在modified_ids中的起始位置（用于mask）
+                segment_start_in_modified = len(modified_ids)
+
                 # 添加当前段落的token
                 segment_tokens = ids[current_pos:end_pos + 1]
                 modified_ids.extend(segment_tokens)
@@ -560,28 +602,18 @@ class Qwen3Model(Qwen3PreTrainedModel):
                     segment_labels = label_row[current_pos:end_pos + 1]
                     modified_label_ids.extend(segment_labels)
 
-                # 识别段落类型
-                segment_content = segment_tokens[start_pos-current_pos:end_pos-current_pos+1] if start_pos >= current_pos else segment_tokens
-                role_type = "未知"
-                if self.system_id in segment_content:
-                    role_type = "system"
-                elif self.user_id in segment_content:
-                    role_type = "user"
-                elif self.assistant_id in segment_content:
-                    role_type = "assistant"
-
-                # 在每个QA轮次结束后添加beacon token，但排除system段落和最后一个段落
-                # system段落不应该被压缩，最后一个段落是当前轮次
-                if i < len(pairs) - 1 and role_type != "system":
+                # 只在历史消息（非system，且在最后一个user之前）后添加beacon
+                if i in history_messages:
                     modified_ids.append(self.beacon_token_id)
                     beacon_pos.append(1)  # 标记这是beacon token位置
-                    segments.append((current_pos, len(modified_ids) - 1))  # 记录这个QA段落的范围
+                    # 记录 (段落在modified中的起始位置, beacon在modified中的位置)
+                    segments.append((segment_start_in_modified, len(modified_ids) - 1))
                     if labels is not None and modified_label_ids is not None:
                         modified_label_ids.append(-100)  # beacon位置不参与loss
 
                 current_pos = end_pos + 1
 
-            # 添加剩余的token
+            # 添加剩余的token（如换行符等）
             if current_pos < len(ids):
                 remaining_tokens = ids[current_pos:]
                 modified_ids.extend(remaining_tokens)
@@ -623,107 +655,141 @@ class Qwen3Model(Qwen3PreTrainedModel):
         if padded_labels is not None:
             modified_labels_tensor = torch.tensor(padded_labels, dtype=labels.dtype, device=labels.device)
 
+        # DEBUG: 打印解析结果
+        total_beacons = beacon_positions.sum().item()
+        # print(f"\033[95m[DEBUG parse_multiturn_dialogue] Total beacons inserted: {total_beacons}\033[0m")
+        # print(f"\033[95m[DEBUG parse_multiturn_dialogue] qa_segments: {qa_segments}\033[0m")
+        # print(f"\033[95m[DEBUG parse_multiturn_dialogue] Original seq_len: {input_ids.shape[1]}, Modified seq_len: {modified_input_ids.shape[1]}\033[0m")
+
         return qa_segments, modified_input_ids, beacon_positions, modified_labels_tensor
 
     def compress_kv_cache(self, past_key_values: Cache, beacon_positions: torch.Tensor) -> Cache:
         """
-        压缩KV cache，只保留beacon token的KV，并修正其位置编码以保持相对位置一致性。
-        支持Batch > 1，会自动处理不同样本beacon数量不一致的情况（进行padding）。
+        压缩KV cache，保留beacon token的KV + 当前轮次(最后一个beacon之后)的所有token。
+
+        压缩逻辑：
+        - 输入: System + Q1 + A1 + B1 + Q2 + A2 + B2 + Q3 (当前query)
+        - 输出: B1 + B2 + Q3
+        - 历史轮次的body (Q1, A1, Q2, A2) 被丢弃，只保留其beacon表示
+        - 当前轮次Q3完整保留
+
+        支持Batch > 1，会自动处理不同样本长度不一致的情况（进行padding）。
         """
         if past_key_values is None or not torch.any(beacon_positions):
             return past_key_values
 
         batch_size = beacon_positions.shape[0]
-        device = past_key_values.key_cache[0].device
-        dtype = past_key_values.key_cache[0].dtype
+        seq_len = beacon_positions.shape[1]
 
-        # 1. 预先计算每个样本的beacon索引和相关信息
-        batch_beacon_indices = []
-        max_beacons = 0
+        # 兼容新旧版本的 DynamicCache API
+        if hasattr(past_key_values, 'key_cache'):
+            key_cache_list = past_key_values.key_cache
+            value_cache_list = past_key_values.value_cache
+        else:
+            num_layers = len(past_key_values)
+            key_cache_list = [past_key_values[i][0] for i in range(num_layers)]
+            value_cache_list = [past_key_values[i][1] for i in range(num_layers)]
+
+        device = key_cache_list[0].device
+        dtype = key_cache_list[0].dtype
+        kv_seq_len = key_cache_list[0].shape[2]
+
+        # 1. 计算每个样本需要保留的索引：beacon positions + 最后一个beacon之后的所有位置
+        batch_keep_indices = []
+        max_keep_len = 0
 
         for b in range(batch_size):
-            # 获取当前样本所有beacon的索引
-            indices = torch.nonzero(beacon_positions[b], as_tuple=False).squeeze(-1)
-            batch_beacon_indices.append(indices)
-            max_beacons = max(max_beacons, len(indices))
+            # 获取beacon索引
+            beacon_indices = torch.nonzero(beacon_positions[b], as_tuple=False).squeeze(-1)
 
-        if max_beacons == 0:
+            if len(beacon_indices.shape) == 0:  # 单个元素时squeeze会变成标量
+                beacon_indices = beacon_indices.unsqueeze(0)
+
+            if len(beacon_indices) > 0:
+                # 最后一个beacon的位置
+                last_beacon_pos = beacon_indices[-1].item()
+                # 当前轮次的范围：最后一个beacon之后到序列末尾
+                # 注意：kv_seq_len可能和beacon_positions的seq_len不同（如果有padding）
+                current_turn_start = last_beacon_pos + 1
+                current_turn_end = min(seq_len, kv_seq_len)
+
+                # 当前轮次的索引
+                if current_turn_start < current_turn_end:
+                    current_turn_indices = torch.arange(current_turn_start, current_turn_end, device=device)
+                    # 合并：beacon indices + current turn indices
+                    keep_indices = torch.cat([beacon_indices, current_turn_indices])
+                else:
+                    keep_indices = beacon_indices
+            else:
+                # 没有beacon，保留所有（不压缩）
+                keep_indices = torch.arange(min(seq_len, kv_seq_len), device=device)
+
+            batch_keep_indices.append(keep_indices)
+            max_keep_len = max(max_keep_len, len(keep_indices))
+
+        if max_keep_len == 0:
             return past_key_values
 
         # 2. 准备新的Cache容器
         compressed_cache = DynamicCache()
-        num_layers = len(past_key_values.key_cache)
+        num_layers = len(key_cache_list)
 
         for layer_idx in range(num_layers):
-            # 获取当前层的KV [batch, num_heads, seq_len, head_dim]
-            original_key = past_key_values.key_cache[layer_idx]
-            original_value = past_key_values.value_cache[layer_idx]
+            original_key = key_cache_list[layer_idx]  # [batch, num_heads, seq_len, head_dim]
+            original_value = value_cache_list[layer_idx]
 
             num_heads = original_key.shape[1]
             head_dim = original_key.shape[3]
 
-            # 准备收集压缩后的KV
-            # 初始化为0 (Padding)
             new_key_list = []
             new_value_list = []
 
             for b in range(batch_size):
-                indices = batch_beacon_indices[b]
-                current_count = len(indices)
+                keep_indices = batch_keep_indices[b]
+                keep_count = len(keep_indices)
 
-                if current_count > 0:
-                    # 提取当前样本的Beacon KV [num_heads, num_beacons, head_dim]
-                    # 注意：original_key[b] shape is [num_heads, seq_len, head_dim]
-                    k_chunk = original_key[b, :, indices, :]
-                    v_chunk = original_value[b, :, indices, :]
+                if keep_count > 0:
+                    # 提取需要保留的KV
+                    k_chunk = original_key[b, :, keep_indices, :]  # [num_heads, keep_count, head_dim]
+                    v_chunk = original_value[b, :, keep_indices, :]
 
                     # === RoPE 修正逻辑 ===
-                    # 目标位置: 0, 1, ..., N-1
-                    target_pos = torch.arange(current_count, device=device)
-                    # 原始位置: indices
-                    # Delta = 目标 - 原始
-                    delta = target_pos - indices
+                    # 将保留的token重新映射到连续位置 0, 1, 2, ...
+                    target_pos = torch.arange(keep_count, device=device)
+                    delta = target_pos - keep_indices
 
-                    # 获取Delta对应的cos/sin
-                    # position_ids 需要 shape [1, seq_len]
                     delta_input = delta.unsqueeze(0)
                     cos, sin = self.rotary_emb(v_chunk, position_ids=delta_input)
 
-                    # 因为apply_rotary_pos_emb期望输入包含batch维度，我们需要unsqueeze/squeeze
-                    # k_chunk: [num_heads, num_beacons, head_dim] -> [1, num_heads, num_beacons, head_dim]
                     k_chunk_unsqueezed = k_chunk.unsqueeze(0)
-
-                    # 对Key进行旋转修正
-                    # 注意：我们只关心Key的修正，Value不需要旋转
                     _, k_chunk_corrected = apply_rotary_pos_emb(
                         k_chunk_unsqueezed, k_chunk_unsqueezed, cos, sin
                     )
-
-                    # 移除临时的batch维度
                     k_chunk = k_chunk_corrected.squeeze(0)
 
-                    # Padding处理 (如果当前beacon数少于最大beacon数)
-                    if current_count < max_beacons:
-                        pad_len = max_beacons - current_count
+                    # Padding处理
+                    if keep_count < max_keep_len:
+                        pad_len = max_keep_len - keep_count
                         pad_k = torch.zeros((num_heads, pad_len, head_dim), device=device, dtype=dtype)
                         pad_v = torch.zeros((num_heads, pad_len, head_dim), device=device, dtype=dtype)
                         k_chunk = torch.cat([k_chunk, pad_k], dim=1)
                         v_chunk = torch.cat([v_chunk, pad_v], dim=1)
-
                 else:
-                    # 如果该样本没有beacon，全填0
-                    k_chunk = torch.zeros((num_heads, max_beacons, head_dim), device=device, dtype=dtype)
-                    v_chunk = torch.zeros((num_heads, max_beacons, head_dim), device=device, dtype=dtype)
+                    k_chunk = torch.zeros((num_heads, max_keep_len, head_dim), device=device, dtype=dtype)
+                    v_chunk = torch.zeros((num_heads, max_keep_len, head_dim), device=device, dtype=dtype)
 
                 new_key_list.append(k_chunk)
                 new_value_list.append(v_chunk)
 
-            # 堆叠回Batch维度 [batch, num_heads, max_beacons, head_dim]
             new_key_batch = torch.stack(new_key_list, dim=0)
             new_value_batch = torch.stack(new_value_list, dim=0)
+            compressed_cache.update(new_key_batch, new_value_batch, layer_idx)
 
-            compressed_cache.key_cache.append(new_key_batch)
-            compressed_cache.value_cache.append(new_value_batch)
+        # Debug info
+        original_len = past_key_values.get_seq_length()
+        compressed_len = compressed_cache.get_seq_length()
+        num_beacons = beacon_positions.sum().item()
+        # print(f"\033[92m[DEBUG compress_kv_cache] KV cache: {original_len} -> {compressed_len} tokens (beacons: {num_beacons}, current_turn: {compressed_len - num_beacons})\033[0m")
 
         return compressed_cache
 
@@ -764,9 +830,16 @@ class Qwen3Model(Qwen3PreTrainedModel):
         qa_segments = None
         modified_labels = None
 
-        # 只在预填充阶段（past_key_values为None）进行beacon压缩
-        if (input_ids is not None and enable_beacon_compression and
-            past_key_values is None):
+        # 检查是否是prefill阶段：past_key_values为None 或者 长度为0
+        is_prefill = (past_key_values is None or
+                      (hasattr(past_key_values, 'get_seq_length') and past_key_values.get_seq_length() == 0))
+
+        # DEBUG: 检查 prefill 条件
+        # kv_len = past_key_values.get_seq_length() if past_key_values is not None and hasattr(past_key_values, 'get_seq_length') else 0
+        # print(f"\033[94m[DEBUG forward] Prefill check: is_prefill={is_prefill}, input_ids.shape={input_ids.shape if input_ids is not None else None}, kv_len={kv_len}\033[0m")
+
+        # 只在预填充阶段进行beacon压缩
+        if (input_ids is not None and enable_beacon_compression and is_prefill):
             # 解析多轮对话并添加beacon token
             qa_segments, modified_input_ids, beacon_positions, modified_labels = self.parse_multiturn_dialogue(
                 input_ids, labels
@@ -876,11 +949,17 @@ class Qwen3Model(Qwen3PreTrainedModel):
             )
 
         hidden_states = self.norm(hidden_states)
-        
+
         # 维护KV cache压缩（只保留beacon token的KV）
         # 在预填充完成后或生成阶段，当beacon压缩启用且存在beacon位置时进行压缩
         # 重要：beacon_positions在prefill阶段生成后，在生成阶段会持续用于KV压缩
-        if (use_cache and enable_beacon_compression and beacon_positions is not None and 
+
+        # DEBUG: 打印压缩条件检查
+        # kv_len = past_key_values.get_seq_length() if past_key_values is not None else 0
+        # beacon_count = beacon_positions.sum().item() if beacon_positions is not None else 0
+        # print(f"\033[93m[DEBUG forward] Compression check: use_cache={use_cache}, enable_beacon={enable_beacon_compression}, beacon_positions is None={beacon_positions is None}, beacon_count={beacon_count}, kv_len={kv_len}\033[0m")
+
+        if (use_cache and enable_beacon_compression and beacon_positions is not None and
             torch.any(beacon_positions) and past_key_values is not None and past_key_values.get_seq_length() > 0):
             past_key_values = self.compress_kv_cache(past_key_values, beacon_positions)
             
@@ -908,6 +987,9 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
+        # Beacon compression 默认启用
+        self.enable_beacon_compression = True
+
         # Initialize weights and apply final processing
         self.post_init()
         
@@ -928,7 +1010,85 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
 
     def get_decoder(self):
         return self.model
-        
+
+    def prepare_inputs_for_generation(
+        self,
+        input_ids,
+        past_key_values=None,
+        attention_mask=None,
+        inputs_embeds=None,
+        cache_position=None,
+        position_ids=None,
+        use_cache=True,
+        **kwargs,
+    ):
+        """
+        准备生成所需的输入，确保 enable_beacon_compression 参数正确传递
+        """
+        # 如果有 past_key_values，说明是 decoding 阶段，只取最后一个 token
+        if past_key_values is not None:
+            if inputs_embeds is not None:
+                input_ids = input_ids[:, -cache_position.shape[0]:]
+            elif input_ids.shape[1] != cache_position.shape[0]:
+                input_ids = input_ids[:, cache_position]
+
+        # 处理 position_ids
+        if attention_mask is not None and position_ids is None:
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 1)
+            if past_key_values is not None:
+                position_ids = position_ids[:, -input_ids.shape[1]:]
+                position_ids = position_ids.clone(memory_format=torch.contiguous_format)
+
+        # 处理 inputs_embeds（仅在第一次迭代使用）
+        if inputs_embeds is not None and cache_position[0] == 0:
+            model_inputs = {"inputs_embeds": inputs_embeds, "input_ids": None}
+        else:
+            model_inputs = {"input_ids": input_ids.clone(memory_format=torch.contiguous_format), "inputs_embeds": None}
+
+        # 传递 cache_position 来进行正确的 mask 切片
+        if isinstance(past_key_values, Cache) and attention_mask is not None and attention_mask.ndim == 2:
+            if model_inputs["inputs_embeds"] is not None:
+                batch_size, sequence_length, _ = model_inputs["inputs_embeds"].shape
+                device = model_inputs["inputs_embeds"].device
+            else:
+                batch_size, sequence_length = model_inputs["input_ids"].shape
+                device = model_inputs["input_ids"].device
+
+            attention_mask = self.model._prepare_4d_causal_attention_mask_with_cache_position(
+                attention_mask,
+                sequence_length=sequence_length,
+                target_length=past_key_values.get_max_cache_shape(),
+                dtype=self.lm_head.weight.dtype,
+                device=device,
+                cache_position=cache_position,
+                batch_size=batch_size,
+            ) if hasattr(self.model, '_prepare_4d_causal_attention_mask_with_cache_position') else attention_mask
+
+        model_inputs.update(
+            {
+                "position_ids": position_ids,
+                "cache_position": cache_position,
+                "past_key_values": past_key_values,
+                "use_cache": use_cache,
+                "attention_mask": attention_mask,
+                # 关键：使用模型属性传递自定义参数（避免 kwargs 被 generate() 过滤）
+                "enable_beacon_compression": getattr(self, 'enable_beacon_compression', True),
+            }
+        )
+        return model_inputs
+
+    def generate(self, input_ids=None, **kwargs):
+        """
+        重写 generate 方法，确保 beacon compression 参数正确设置
+        """
+        # 从 kwargs 中提取 enable_beacon_compression，如果有的话用它更新模型属性
+        if 'enable_beacon_compression' in kwargs:
+            self.enable_beacon_compression = kwargs.pop('enable_beacon_compression')
+
+        # 调用父类的 generate 方法
+        return super().generate(input_ids=input_ids, **kwargs)
+
     @classmethod
     def from_pretrained(cls, *args, **kwargs):
         """

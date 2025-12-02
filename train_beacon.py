@@ -13,6 +13,7 @@ import numpy as np
 import math
 
 import torch
+import torch.distributed as dist
 from datasets import DatasetDict, load_dataset, load_from_disk, concatenate_datasets
 from transformers import AutoTokenizer, Trainer, TrainingArguments, TrainerCallback, AutoConfig
 
@@ -631,7 +632,7 @@ def main() -> None:
         )
 
         config = AutoConfig.from_pretrained(args.model_path, trust_remote_code=True)
-        
+
         if config.model_type == "qwen2":
             model_cls = Qwen2ForCausalLM
             logger.info("Detected Qwen2 architecture. Using Qwen2ForCausalLM.")
@@ -642,10 +643,18 @@ def main() -> None:
             logger.warning(f"Unknown model type: {config.model_type}. Defaulting to Qwen2ForCausalLM.")
             model_cls = Qwen2ForCausalLM
 
+        # 检测可用GPU数量
+        n_gpus = torch.cuda.device_count()
+        logger.info(f"Detected {n_gpus} GPU(s) available for training")
+
+        # 对于多GPU训练，不使用 device_map="auto"（那是模型并行）
+        # 而是让 HuggingFace Trainer 自动处理 DataParallel/DistributedDataParallel
+        # 当通过 torchrun 或设置 CUDA_VISIBLE_DEVICES 启动时，Trainer 会自动识别并使用多卡
         model = model_cls.from_pretrained(
             args.model_path,
             torch_dtype=torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else None),
-            device_map="auto" if torch.cuda.is_available() else None,
+            # 不使用 device_map，让 Trainer 管理设备分配
+            device_map=None,
         )
         model.config.use_cache = False
 
@@ -666,6 +675,10 @@ def main() -> None:
         data_collator = BeaconDataCollator(tokenizer=tokenizer)
 
         evaluation_strategy = "steps" if eval_dataset is not None else "no"
+
+        # 检测是否在分布式环境中运行
+        is_distributed = n_gpus > 1
+
         training_kwargs = {
             "output_dir": args.output_dir,
             "per_device_train_batch_size": args.per_device_train_batch_size,
@@ -692,6 +705,9 @@ def main() -> None:
             "optim": "adamw_torch",
             "seed": args.seed,
             "prediction_loss_only": False,
+            # 多GPU相关配置
+            "dataloader_num_workers": 4 if is_distributed else 0,
+            "ddp_find_unused_parameters": False,  # beacon参数可能未被使用，但我们显式冻结了
         }
         if eval_dataset is not None:
             training_kwargs["eval_steps"] = args.save_steps

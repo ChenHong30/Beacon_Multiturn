@@ -558,104 +558,117 @@ class Qwen2Model(Qwen2PreTrainedModel):
     
     def compress_kv_cache(self, past_key_values: Cache, beacon_positions: torch.Tensor) -> Cache:
         """
-        压缩KV cache，只保留beacon token的KV，并修正其位置编码以保持相对位置一致性。
-        支持Batch > 1，会自动处理不同样本beacon数量不一致的情况（进行padding）。
+        压缩KV cache，保留beacon token的KV + 当前轮次(最后一个beacon之后)的所有token。
+
+        压缩逻辑：
+        - 输入: System + Q1 + A1 + B1 + Q2 + A2 + B2 + Q3 (当前query)
+        - 输出: B1 + B2 + Q3
+        - 历史轮次的body (Q1, A1, Q2, A2) 被丢弃，只保留其beacon表示
+        - 当前轮次Q3完整保留
+
+        支持Batch > 1，会自动处理不同样本长度不一致的情况（进行padding）。
         """
         if past_key_values is None or not torch.any(beacon_positions):
             return past_key_values
-        
+
         batch_size = beacon_positions.shape[0]
+        seq_len = beacon_positions.shape[1]
         device = past_key_values.key_cache[0].device
         dtype = past_key_values.key_cache[0].dtype
-        
-        # 1. 预先计算每个样本的beacon索引和相关信息
-        batch_beacon_indices = []
-        max_beacons = 0
-        
+        kv_seq_len = past_key_values.key_cache[0].shape[2]
+
+        # 1. 计算每个样本需要保留的索引：beacon positions + 最后一个beacon之后的所有位置
+        batch_keep_indices = []
+        max_keep_len = 0
+
         for b in range(batch_size):
-            # 获取当前样本所有beacon的索引
-            indices = torch.nonzero(beacon_positions[b], as_tuple=False).squeeze(-1)
-            batch_beacon_indices.append(indices)
-            max_beacons = max(max_beacons, len(indices))
-            
-        if max_beacons == 0:
+            # 获取beacon索引
+            beacon_indices = torch.nonzero(beacon_positions[b], as_tuple=False).squeeze(-1)
+
+            if len(beacon_indices.shape) == 0:  # 单个元素时squeeze会变成标量
+                beacon_indices = beacon_indices.unsqueeze(0)
+
+            if len(beacon_indices) > 0:
+                # 最后一个beacon的位置
+                last_beacon_pos = beacon_indices[-1].item()
+                # 当前轮次的范围：最后一个beacon之后到序列末尾
+                current_turn_start = last_beacon_pos + 1
+                current_turn_end = min(seq_len, kv_seq_len)
+
+                # 当前轮次的索引
+                if current_turn_start < current_turn_end:
+                    current_turn_indices = torch.arange(current_turn_start, current_turn_end, device=device)
+                    # 合并：beacon indices + current turn indices
+                    keep_indices = torch.cat([beacon_indices, current_turn_indices])
+                else:
+                    keep_indices = beacon_indices
+            else:
+                # 没有beacon，保留所有（不压缩）
+                keep_indices = torch.arange(min(seq_len, kv_seq_len), device=device)
+
+            batch_keep_indices.append(keep_indices)
+            max_keep_len = max(max_keep_len, len(keep_indices))
+
+        if max_keep_len == 0:
             return past_key_values
 
         # 2. 准备新的Cache容器
         compressed_cache = DynamicCache()
         num_layers = len(past_key_values.key_cache)
-        
+
         for layer_idx in range(num_layers):
-            # 获取当前层的KV [batch, num_heads, seq_len, head_dim]
-            original_key = past_key_values.key_cache[layer_idx]
+            original_key = past_key_values.key_cache[layer_idx]  # [batch, num_heads, seq_len, head_dim]
             original_value = past_key_values.value_cache[layer_idx]
-            
+
             num_heads = original_key.shape[1]
             head_dim = original_key.shape[3]
-            
-            # 准备收集压缩后的KV
-            # 初始化为0 (Padding)
+
             new_key_list = []
             new_value_list = []
-            
+
             for b in range(batch_size):
-                indices = batch_beacon_indices[b]
-                current_count = len(indices)
-                
-                if current_count > 0:
-                    # 提取当前样本的Beacon KV [num_heads, num_beacons, head_dim]
-                    # 注意：original_key[b] shape is [num_heads, seq_len, head_dim]
-                    k_chunk = original_key[b, :, indices, :]
-                    v_chunk = original_value[b, :, indices, :]
-                    
+                keep_indices = batch_keep_indices[b]
+                keep_count = len(keep_indices)
+
+                if keep_count > 0:
+                    # 提取需要保留的KV
+                    k_chunk = original_key[b, :, keep_indices, :]  # [num_heads, keep_count, head_dim]
+                    v_chunk = original_value[b, :, keep_indices, :]
+
                     # === RoPE 修正逻辑 ===
-                    # 目标位置: 0, 1, ..., N-1
-                    target_pos = torch.arange(current_count, device=device)
-                    # 原始位置: indices
-                    # Delta = 目标 - 原始
-                    delta = target_pos - indices
-                    
-                    # 获取Delta对应的cos/sin
-                    # position_ids 需要 shape [1, seq_len]
+                    # 将保留的token重新映射到连续位置 0, 1, 2, ...
+                    target_pos = torch.arange(keep_count, device=device)
+                    delta = target_pos - keep_indices
+
                     delta_input = delta.unsqueeze(0)
                     cos, sin = self.rotary_emb(v_chunk, position_ids=delta_input)
-                    
-                    # 因为apply_rotary_pos_emb期望输入包含batch维度，我们需要unsqueeze/squeeze
-                    # k_chunk: [num_heads, num_beacons, head_dim] -> [1, num_heads, num_beacons, head_dim]
+
                     k_chunk_unsqueezed = k_chunk.unsqueeze(0)
-                    
-                    # 对Key进行旋转修正
-                    # 注意：我们只关心Key的修正，Value不需要旋转
                     _, k_chunk_corrected = apply_rotary_pos_emb(
                         k_chunk_unsqueezed, k_chunk_unsqueezed, cos, sin
                     )
-                    
-                    # 移除临时的batch维度
                     k_chunk = k_chunk_corrected.squeeze(0)
-                    
-                    # Padding处理 (如果当前beacon数少于最大beacon数)
-                    if current_count < max_beacons:
-                        pad_len = max_beacons - current_count
+
+                    # Padding处理
+                    if keep_count < max_keep_len:
+                        pad_len = max_keep_len - keep_count
                         pad_k = torch.zeros((num_heads, pad_len, head_dim), device=device, dtype=dtype)
                         pad_v = torch.zeros((num_heads, pad_len, head_dim), device=device, dtype=dtype)
                         k_chunk = torch.cat([k_chunk, pad_k], dim=1)
                         v_chunk = torch.cat([v_chunk, pad_v], dim=1)
-                
                 else:
-                    # 如果该样本没有beacon，全填0
-                    k_chunk = torch.zeros((num_heads, max_beacons, head_dim), device=device, dtype=dtype)
-                    v_chunk = torch.zeros((num_heads, max_beacons, head_dim), device=device, dtype=dtype)
-                
+                    k_chunk = torch.zeros((num_heads, max_keep_len, head_dim), device=device, dtype=dtype)
+                    v_chunk = torch.zeros((num_heads, max_keep_len, head_dim), device=device, dtype=dtype)
+
                 new_key_list.append(k_chunk)
                 new_value_list.append(v_chunk)
-            
-            # 堆叠回Batch维度 [batch, num_heads, max_beacons, head_dim]
+
             new_key_batch = torch.stack(new_key_list, dim=0)
             new_value_batch = torch.stack(new_value_list, dim=0)
-            
+
             compressed_cache.key_cache.append(new_key_batch)
             compressed_cache.value_cache.append(new_value_batch)
-            
+
         return compressed_cache
 
     @can_return_tuple
