@@ -557,9 +557,9 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 else:
                     message_roles.append("unknown")
 
-            # DEBUG: 打印角色检测结果
-            print(f"\033[94m[DEBUG roles] message_roles: {message_roles}\033[0m")
-            print(f"\033[94m[DEBUG roles] Checking token IDs - system_id: {self.system_id}, user_id: {self.user_id}, assistant_id: {self.assistant_id}\033[0m")
+            # # DEBUG: 打印角色检测结果
+            # print(f"\033[94m[DEBUG roles] message_roles: {message_roles}\033[0m")
+            # print(f"\033[94m[DEBUG roles] Checking token IDs - system_id: {self.system_id}, user_id: {self.user_id}, assistant_id: {self.assistant_id}\033[0m")
 
             # 找到最后一个user消息的索引（这是当前轮次的问题，不应该被压缩）
             last_user_idx = -1
@@ -575,8 +575,8 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 if i < last_user_idx and message_roles[i] != "system":
                     history_messages.append(i)
 
-            # DEBUG: 打印历史轮次分析
-            print(f"\033[94m[DEBUG roles] last_user_idx: {last_user_idx}, history_messages: {history_messages}\033[0m")
+            # # DEBUG: 打印历史轮次分析
+            # print(f"\033[94m[DEBUG roles] last_user_idx: {last_user_idx}, history_messages: {history_messages}\033[0m")
 
             # 如果没有历史消息需要压缩，直接返回原始输入
             if len(history_messages) == 0:
@@ -655,18 +655,18 @@ class Qwen3Model(Qwen3PreTrainedModel):
         if padded_labels is not None:
             modified_labels_tensor = torch.tensor(padded_labels, dtype=labels.dtype, device=labels.device)
 
-        # DEBUG: 打印解析结果
-        total_beacons = beacon_positions.sum().item()
-        if total_beacons > 0:
-            print(f"\033[95m[DEBUG parse_multiturn] Total beacons: {total_beacons}\033[0m")
-            print(f"\033[95m[DEBUG parse_multiturn] Original seq_len: {input_ids.shape[1]}, Modified seq_len: {modified_input_ids.shape[1]}\033[0m")
-            # 打印角色检测信息（只针对第一个batch）
-            if qa_segments and len(qa_segments) > 0 and len(qa_segments[0]) > 0:
-                print(f"\033[95m[DEBUG parse_multiturn] qa_segments[0]: {qa_segments[0]}\033[0m")
-            # 打印beacon位置
-            beacon_indices = torch.nonzero(beacon_positions[0], as_tuple=False).squeeze(-1)
-            if beacon_indices.numel() > 0:
-                print(f"\033[95m[DEBUG parse_multiturn] Beacon positions in modified seq: {beacon_indices.tolist()}\033[0m")
+        # # DEBUG: 打印解析结果
+        # total_beacons = beacon_positions.sum().item()
+        # if total_beacons > 0:
+        #     print(f"\033[95m[DEBUG parse_multiturn] Total beacons: {total_beacons}\033[0m")
+        #     print(f"\033[95m[DEBUG parse_multiturn] Original seq_len: {input_ids.shape[1]}, Modified seq_len: {modified_input_ids.shape[1]}\033[0m")
+        #     # 打印角色检测信息（只针对第一个batch）
+        #     if qa_segments and len(qa_segments) > 0 and len(qa_segments[0]) > 0:
+        #         print(f"\033[95m[DEBUG parse_multiturn] qa_segments[0]: {qa_segments[0]}\033[0m")
+        #     # 打印beacon位置
+        #     beacon_indices = torch.nonzero(beacon_positions[0], as_tuple=False).squeeze(-1)
+        #     if beacon_indices.numel() > 0:
+        #         print(f"\033[95m[DEBUG parse_multiturn] Beacon positions in modified seq: {beacon_indices.tolist()}\033[0m")
 
         return qa_segments, modified_input_ids, beacon_positions, modified_labels_tensor
 
@@ -806,13 +806,13 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
                     delta = target_pos - keep_indices
 
-                    # DEBUG: 打印RoPE修正信息（只在第一层打印）
-                    if layer_idx == 0 and b == 0:
-                        print(f"\033[93m[DEBUG RoPE] system_end: {system_end}, num_beacons: {num_beacons}\033[0m")
-                        print(f"\033[93m[DEBUG RoPE] Original positions (first 5): {keep_indices[:5].tolist()}\033[0m")
-                        print(f"\033[93m[DEBUG RoPE] Target positions (first 5): {target_pos[:5].tolist()}\033[0m")
-                        print(f"\033[93m[DEBUG RoPE] Delta (first 5): {delta[:5].tolist()}\033[0m")
-                        print(f"\033[93m[DEBUG RoPE] Delta (last 5): {delta[-5:].tolist()}\033[0m")
+                    # # DEBUG: 打印RoPE修正信息（只在第一层打印）
+                    # if layer_idx == 0 and b == 0:
+                    #     print(f"\033[93m[DEBUG RoPE] system_end: {system_end}, num_beacons: {num_beacons}\033[0m")
+                    #     print(f"\033[93m[DEBUG RoPE] Original positions (first 5): {keep_indices[:5].tolist()}\033[0m")
+                    #     print(f"\033[93m[DEBUG RoPE] Target positions (first 5): {target_pos[:5].tolist()}\033[0m")
+                    #     print(f"\033[93m[DEBUG RoPE] Delta (first 5): {delta[:5].tolist()}\033[0m")
+                    #     print(f"\033[93m[DEBUG RoPE] Delta (last 5): {delta[-5:].tolist()}\033[0m")
 
                     delta_input = delta.unsqueeze(0)
                     cos, sin = self.rotary_emb(v_chunk, position_ids=delta_input)
@@ -841,20 +841,21 @@ class Qwen3Model(Qwen3PreTrainedModel):
             new_value_batch = torch.stack(new_value_list, dim=0)
             compressed_cache.update(new_key_batch, new_value_batch, layer_idx)
 
-        # Debug info
-        original_len = past_key_values.get_seq_length()
+        # 计算压缩后的长度（供生成阶段使用）
         compressed_len = compressed_cache.get_seq_length()
-        num_beacons = beacon_positions.sum().item()
 
-        # 详细DEBUG信息
-        print(f"\033[95m[DEBUG compress_kv_cache] Original KV len: {original_len}, Compressed len: {compressed_len}\033[0m")
-        print(f"\033[95m[DEBUG compress_kv_cache] Beacons: {num_beacons}, Current turn tokens: {compressed_len - num_beacons}\033[0m")
-        if batch_keep_indices:
-            sample_indices = batch_keep_indices[0]
-            if len(sample_indices) > 0:
-                print(f"\033[95m[DEBUG compress_kv_cache] keep_indices (first 5): {sample_indices[:5].tolist()}\033[0m")
-                print(f"\033[95m[DEBUG compress_kv_cache] keep_indices (last 5): {sample_indices[-5:].tolist()}\033[0m")
-        # print(f"\033[92m[DEBUG compress_kv_cache] KV cache: {original_len} -> {compressed_len} tokens (beacons: {num_beacons}, current_turn: {compressed_len - num_beacons})\033[0m")
+        # # Debug info
+        # original_len = past_key_values.get_seq_length()
+        # num_beacons = beacon_positions.sum().item()
+
+        # # 详细DEBUG信息
+        # print(f"\033[95m[DEBUG compress_kv_cache] Original KV len: {original_len}, Compressed len: {compressed_len}\033[0m")
+        # print(f"\033[95m[DEBUG compress_kv_cache] Beacons: {num_beacons}, Current turn tokens: {compressed_len - num_beacons}\033[0m")
+        # if batch_keep_indices:
+        #     sample_indices = batch_keep_indices[0]
+        #     if len(sample_indices) > 0:
+        #         print(f"\033[95m[DEBUG compress_kv_cache] keep_indices (first 5): {sample_indices[:5].tolist()}\033[0m")
+        #         print(f"\033[95m[DEBUG compress_kv_cache] keep_indices (last 5): {sample_indices[-5:].tolist()}\033[0m")
 
         # 保存压缩后的长度，供生成阶段使用
         self._compressed_seq_length = compressed_len
@@ -1073,14 +1074,14 @@ class Qwen3Model(Qwen3PreTrainedModel):
             position_ids = torch.stack(new_position_ids_list, dim=0)
             cache_position = position_ids[0]  # cache_position取第一个batch的
 
-            # DEBUG: 打印位置重映射信息
-            if batch_size > 0 and len(qa_segments) > 0 and len(qa_segments[0]) > 0:
-                print(f"\033[96m[DEBUG Position Remap] Original seq_len: {seq_len}\033[0m")
-                print(f"\033[96m[DEBUG Position Remap] system_end: {qa_segments[0][0][0]}, num_beacons: {beacon_positions[0].sum().item()}\033[0m")
-                print(f"\033[96m[DEBUG Position Remap] New position_ids (first 15): {position_ids[0][:15].tolist()}\033[0m")
-                beacon_idx = torch.nonzero(beacon_positions[0], as_tuple=False).squeeze(-1)
-                if beacon_idx.numel() > 0:
-                    print(f"\033[96m[DEBUG Position Remap] Beacon positions: {beacon_idx.tolist()}, their new pos: {[position_ids[0][i].item() for i in beacon_idx.tolist()]}\033[0m")
+            # # DEBUG: 打印位置重映射信息
+            # if batch_size > 0 and len(qa_segments) > 0 and len(qa_segments[0]) > 0:
+            #     print(f"\033[96m[DEBUG Position Remap] Original seq_len: {seq_len}\033[0m")
+            #     print(f"\033[96m[DEBUG Position Remap] system_end: {qa_segments[0][0][0]}, num_beacons: {beacon_positions[0].sum().item()}\033[0m")
+            #     print(f"\033[96m[DEBUG Position Remap] New position_ids (first 15): {position_ids[0][:15].tolist()}\033[0m")
+            #     beacon_idx = torch.nonzero(beacon_positions[0], as_tuple=False).squeeze(-1)
+            #     if beacon_idx.numel() > 0:
+            #         print(f"\033[96m[DEBUG Position Remap] Beacon positions: {beacon_idx.tolist()}, their new pos: {[position_ids[0][i].item() for i in beacon_idx.tolist()]}\033[0m")
 
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
