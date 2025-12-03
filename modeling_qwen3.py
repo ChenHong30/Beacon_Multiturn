@@ -739,16 +739,13 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 # 当前轮次的索引
                 if current_turn_start < current_turn_end:
                     current_turn_indices = torch.arange(current_turn_start, current_turn_end, device=device)
-                    # === 临时实验：不保留beacon，只保留 System + current turn ===
-                    # 原代码: keep_indices = torch.cat([system_indices, beacon_indices, current_turn_indices])
-                    keep_indices = torch.cat([system_indices, current_turn_indices])  # 去掉beacon
+                    # 合并：System + beacon indices + current turn indices
+                    keep_indices = torch.cat([system_indices, beacon_indices, current_turn_indices])
                 else:
-                    # 原代码: keep_indices = torch.cat([system_indices, beacon_indices])
-                    keep_indices = system_indices  # 去掉beacon
+                    keep_indices = torch.cat([system_indices, beacon_indices])
 
                 batch_system_ends.append(system_end)
-                # === 临时实验：设为0因为不保留beacon ===
-                batch_num_beacons.append(0)  # 原来是 len(beacon_indices)
+                batch_num_beacons.append(len(beacon_indices))
             else:
                 # 没有beacon，保留所有（不压缩）
                 keep_indices = torch.arange(min(seq_len, kv_seq_len), device=device)
@@ -817,9 +814,8 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
                     # DEBUG：验证压缩后的结构
                     if layer_idx == 0 and b == 0:
-                        print(f"\033[93m[实验模式] 不保留Beacon，只保留 System + Current turn\033[0m")
-                        print(f"\033[92m[Compress Debug] System: {system_end}, Beacons: {num_beacons} (已移除), Current turn: {current_turn_count}\033[0m")
-                        print(f"\033[92m[Compress Debug] Total keep_count: {keep_count} = {system_end} + {current_turn_count}\033[0m")
+                        print(f"\033[92m[Compress Debug] System: {system_end}, Beacons: {num_beacons}, Current turn: {current_turn_count}\033[0m")
+                        print(f"\033[92m[Compress Debug] Total keep_count: {keep_count} = {system_end} + {num_beacons} + {current_turn_count}\033[0m")
 
                     # 不再对K应用RoPE修正，因为Forward阶段已经使用了正确的position_ids
 
