@@ -473,6 +473,13 @@ class Qwen3Model(Qwen3PreTrainedModel):
         self.beacon_token_id = self.vocab_size
         self.beacon_embedding = nn.Parameter(torch.empty(config.hidden_size))
 
+        # === 16 Beacons 增强：Learnable Position Embedding ===
+        # 每个 beacon 位置有独立的可学习 embedding，帮助模型区分 16 个 beacons 的角色
+        self.num_beacons_per_segment = 16
+        self.beacon_position_embedding = nn.Parameter(
+            torch.zeros(self.num_beacons_per_segment, config.hidden_size)
+        )
+
         # 用于记录压缩后的 KV cache 长度，供生成阶段使用
         self._compressed_seq_length = None
 
@@ -489,6 +496,10 @@ class Qwen3Model(Qwen3PreTrainedModel):
             # 这样模型会将其视为一个结构化的结束/总结信号
             im_end_embedding = self.embed_tokens.weight[self.im_end_id]
             self.beacon_embedding.copy_(im_end_embedding)
+
+            # 初始化 beacon position embedding（使用小的随机值）
+            # 这让每个 beacon 位置有独特的初始化，帮助模型学习分工
+            nn.init.normal_(self.beacon_position_embedding, mean=0.0, std=0.02)
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -929,8 +940,19 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 beacon_mask = (input_ids == self.beacon_token_id)
                 safe_input_ids[beacon_mask] = 0
                 inputs_embeds = self.embed_tokens(safe_input_ids)
-                # 将 beacon 位置的 embedding 替换为独立的 beacon_embedding
-                inputs_embeds[beacon_mask] = self.beacon_embedding
+
+                # === 16 Beacons 增强：为每个 beacon 添加独特的 position embedding ===
+                # beacon_embedding 是共享的基础 embedding
+                # beacon_position_embedding 根据 beacon 在 segment 内的位置（0-15）添加
+                batch_size, seq_len = input_ids.shape
+                for b in range(batch_size):
+                    beacon_indices = torch.nonzero(beacon_mask[b], as_tuple=False).squeeze(-1)
+                    if beacon_indices.numel() > 0:
+                        # 每 16 个 beacons 为一组（对应一个 segment）
+                        for i, idx in enumerate(beacon_indices.tolist()):
+                            pos_in_segment = i % self.num_beacons_per_segment  # 0-15
+                            # 基础 embedding + 位置 embedding
+                            inputs_embeds[b, idx] = self.beacon_embedding + self.beacon_position_embedding[pos_in_segment]
             else:
                 inputs_embeds = self.embed_tokens(input_ids)
 
@@ -997,22 +1019,40 @@ class Qwen3Model(Qwen3PreTrainedModel):
             for b, segments in enumerate(qa_segments):
                 for (start_i, end_i) in segments:
                     # start_i: 段落开始
-                    # end_i: beacon位置 (该段落的最后一个token)
-                    # Body范围: [start_i, end_i) (不包含beacon)
+                    # end_i: 最后一个 beacon (B16) 的位置
+                    # B1 的位置: end_i - 15
+                    # Body 范围: [start_i, end_i - 15) (不包含 beacons)
+
+                    first_beacon = end_i - 15  # B1 的位置
+                    last_beacon = end_i        # B16 的位置
 
                     # 只有当Body非空时才需要遮蔽
-                    if start_i < end_i:
-                        # Ablation: 16 beacons. Mask Text (start...end-16) from Future (end+1...)
-                        # end_i is index of B16. B1 is at end_i - 15.
-                        # Text ends at end_i - 16.
-                        # Range start_i : end_i - 15 excludes B1...B16.
-                        
+                    if start_i < first_beacon:
+                        # 1. 后续 tokens 看不到历史 body（只能看到 beacons）
                         if end_i + 1 < seq_len:
-                            current_mask[b, 0, end_i + 1:, start_i : end_i - 15] = min_val
+                            current_mask[b, 0, end_i + 1:, start_i : first_beacon] = min_val
 
                             # 同步更新sliding window mask (如果存在)
                             if "sliding_attention" in causal_mask_mapping and causal_mask_mapping["sliding_attention"] is not None:
-                                causal_mask_mapping["sliding_attention"][b, 0, end_i + 1:, start_i : end_i - 15] = min_val
+                                causal_mask_mapping["sliding_attention"][b, 0, end_i + 1:, start_i : first_beacon] = min_val
+
+                        # 2. === 关键修复：让同一 segment 内的 16 个 beacons 能双向 attend ===
+                        # 在 causal mask 中，后面的 beacon 已经能看到前面的 beacon
+                        # 我们需要让前面的 beacon 也能看到后面的 beacon（打破 causal 约束）
+                        # 这样所有 16 个 beacons 都能获得完整信息，协作压缩
+                        for i in range(16):
+                            beacon_i = first_beacon + i
+                            if beacon_i >= seq_len:
+                                break
+                            for j in range(i + 1, 16):  # 让 beacon_i 能看到后面的 beacon_j
+                                beacon_j = first_beacon + j
+                                if beacon_j >= seq_len:
+                                    break
+                                # 允许 beacon_i attend 到 beacon_j（移除 causal mask）
+                                current_mask[b, 0, beacon_i, beacon_j] = 0.0
+
+                                if "sliding_attention" in causal_mask_mapping and causal_mask_mapping["sliding_attention"] is not None:
+                                    causal_mask_mapping["sliding_attention"][b, 0, beacon_i, beacon_j] = 0.0
 
         # === 方案1核心：训练时模拟压缩后的位置配置 ===
         # 当有beacon时，重新计算position_ids使其模拟压缩后的位置分布
@@ -1058,15 +1098,15 @@ class Qwen3Model(Qwen3PreTrainedModel):
                     for i, orig_pos in enumerate(range(current_turn_start, seq_len)):
                         new_pos[orig_pos] = current_turn_new_start + i
 
-                    # 历史body位置（被mask掉的）：给一个合理的位置，虽然它们会被mask
-                    # 使用它们原来在各自segment中的相对位置
+                    # 历史body位置：保持原始位置，这样 beacon 能正确 attend 到 body
+                    # 虽然 body 对后续 tokens 被 mask 了，但 beacon 需要看到 body 来压缩信息
+                    # 保持原始位置确保 RoPE 编码正确，beacon 能区分 body 中不同位置的 token
                     for seg_idx, (seg_start, beacon_pos) in enumerate(qa_segments[b]):
-                        # Ablation: segment body from start to beacon_pos - 15 (exclude 16 beacons)
-                        # Beacons themselves are handled by the beacon_indices loop above.
-                        for i, orig_pos in enumerate(range(seg_start, beacon_pos - 15)):
-                            # 历史body可以用原始位置，因为它们会被attention mask遮蔽
-                            # 但为了一致性，也可以映射到beacon附近
-                            new_pos[orig_pos] = system_end + seg_idx  # 和对应beacon相同位置
+                        first_beacon_of_seg = beacon_pos - 15  # 该 segment 第一个 beacon 的位置
+                        # body 范围: [seg_start, first_beacon_of_seg)
+                        for orig_pos in range(seg_start, first_beacon_of_seg):
+                            # 保持原始位置，让 beacon 能通过 RoPE 正确区分 body 中的不同 token
+                            new_pos[orig_pos] = orig_pos
 
                     new_position_ids_list.append(new_pos)
                 else:
@@ -1281,7 +1321,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         # 调用父类的from_pretrained方法
         model = super().from_pretrained(*args, **kwargs)
 
-        # 初始化 beacon_embedding（用 im_end 的 embedding）
+        # 初始化 beacon_embedding 和 beacon_position_embedding
         model.model.extend_embeddings_for_beacon()
 
         # 确保beacon投影矩阵和beacon_embedding的数据类型与模型一致
@@ -1290,6 +1330,11 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
 
         # 转换 beacon_embedding 的数据类型
         model.model.beacon_embedding.data = model.model.beacon_embedding.data.to(
+            dtype=target_dtype, device=target_device
+        )
+
+        # 转换 beacon_position_embedding 的数据类型
+        model.model.beacon_position_embedding.data = model.model.beacon_position_embedding.data.to(
             dtype=target_dtype, device=target_device
         )
 
