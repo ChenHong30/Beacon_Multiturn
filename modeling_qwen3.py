@@ -604,12 +604,16 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
                 # 只在历史消息（非system，且在最后一个user之前）后添加beacon
                 if i in history_messages:
-                    modified_ids.append(self.beacon_token_id)
-                    beacon_pos.append(1)  # 标记这是beacon token位置
+                    # Ablation: Insert 16 beacon tokens
+                    for _ in range(16):
+                        modified_ids.append(self.beacon_token_id)
+                        beacon_pos.append(1)  # 标记这是beacon token位置
+                        if labels is not None and modified_label_ids is not None:
+                            modified_label_ids.append(-100)  # beacon位置不参与loss
+
                     # 记录 (段落在modified中的起始位置, beacon在modified中的位置)
+                    # 指向这一批beacons的最后一个
                     segments.append((segment_start_in_modified, len(modified_ids) - 1))
-                    if labels is not None and modified_label_ids is not None:
-                        modified_label_ids.append(-100)  # beacon位置不参与loss
 
                 current_pos = end_pos + 1
 
@@ -998,15 +1002,17 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
                     # 只有当Body非空时才需要遮蔽
                     if start_i < end_i:
-                        # 遮蔽规则：当前段落之后的所有token (end_i + 1 :)
-                        # 不能看到当前段落的Body (start_i : end_i)
-                        # 这样强制模型必须通过beacon (end_i) 来获取该段落的信息
+                        # Ablation: 16 beacons. Mask Text (start...end-16) from Future (end+1...)
+                        # end_i is index of B16. B1 is at end_i - 15.
+                        # Text ends at end_i - 16.
+                        # Range start_i : end_i - 15 excludes B1...B16.
+                        
                         if end_i + 1 < seq_len:
-                            current_mask[b, 0, end_i + 1:, start_i : end_i] = min_val
+                            current_mask[b, 0, end_i + 1:, start_i : end_i - 15] = min_val
 
                             # 同步更新sliding window mask (如果存在)
                             if "sliding_attention" in causal_mask_mapping and causal_mask_mapping["sliding_attention"] is not None:
-                                causal_mask_mapping["sliding_attention"][b, 0, end_i + 1:, start_i : end_i] = min_val
+                                causal_mask_mapping["sliding_attention"][b, 0, end_i + 1:, start_i : end_i - 15] = min_val
 
         # === 方案1核心：训练时模拟压缩后的位置配置 ===
         # 当有beacon时，重新计算position_ids使其模拟压缩后的位置分布
@@ -1055,8 +1061,9 @@ class Qwen3Model(Qwen3PreTrainedModel):
                     # 历史body位置（被mask掉的）：给一个合理的位置，虽然它们会被mask
                     # 使用它们原来在各自segment中的相对位置
                     for seg_idx, (seg_start, beacon_pos) in enumerate(qa_segments[b]):
-                        # segment body从seg_start到beacon_pos-1
-                        for i, orig_pos in enumerate(range(seg_start, beacon_pos)):
+                        # Ablation: segment body from start to beacon_pos - 15 (exclude 16 beacons)
+                        # Beacons themselves are handled by the beacon_indices loop above.
+                        for i, orig_pos in enumerate(range(seg_start, beacon_pos - 15)):
                             # 历史body可以用原始位置，因为它们会被attention mask遮蔽
                             # 但为了一致性，也可以映射到beacon附近
                             new_pos[orig_pos] = system_end + seg_idx  # 和对应beacon相同位置
