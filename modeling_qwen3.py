@@ -812,9 +812,12 @@ class Qwen3Model(Qwen3PreTrainedModel):
                     #
                     # 因此KV cache中的K已经带有正确的RoPE，不需要再修正！
 
-                    # DEBUG：验证修复（注释掉减少输出噪音）
-                    # if layer_idx == 0 and b == 0:
-                    #     print(f"\033[92m[RoPE修复] 跳过RoPE修正 - Forward已用正确position_ids\033[0m")
+                    # DEBUG：验证压缩后的结构
+                    if layer_idx == 0 and b == 0:
+                        print(f"\033[92m[Compress Debug] System: {system_end}, Beacons: {num_beacons}, Current turn: {current_turn_count}\033[0m")
+                        print(f"\033[92m[Compress Debug] Total keep_count: {keep_count} = {system_end} + {num_beacons} + {current_turn_count}\033[0m")
+                        if current_turn_count > 0:
+                            print(f"\033[92m[Compress Debug] Current turn indices (first 5): {keep_indices[-min(5,current_turn_count):].tolist()}\033[0m")
 
                     # 不再对K应用RoPE修正，因为Forward阶段已经使用了正确的position_ids
 
