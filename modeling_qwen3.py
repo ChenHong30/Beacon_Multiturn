@@ -804,38 +804,19 @@ class Qwen3Model(Qwen3PreTrainedModel):
                     for i in range(current_turn_count):
                         target_pos[system_end + num_beacons + i] = current_turn_new_start + i
 
-                    delta = target_pos - keep_indices
+                    # === RoPE 修正逻辑 ===
+                    # 关键洞察：Forward阶段已经对position_ids进行了重映射！
+                    # - System tokens: position_ids = 0~system_end-1 (与物理位置相同)
+                    # - Beacon tokens: position_ids = system_end, system_end+1, ... (重映射后)
+                    # - Current turn: position_ids = system_end+num_beacons, ... (重映射后)
+                    #
+                    # 因此KV cache中的K已经带有正确的RoPE，不需要再修正！
 
-                    # DEBUG RoPE验证：打印compress阶段的RoPE修正信息（只在第一层打印）
-                    if layer_idx == 0 and b == 0:
-                        # 计算当前轮次在keep_indices中的范围
-                        current_start_in_keep = system_end + num_beacons
-                        current_count = current_turn_count
-                        print(f"\033[93m╔══════════════════════════════════════════════════════════════╗\033[0m")
-                        print(f"\033[93m║  [RoPE验证 - Compress阶段] Delta Calculation                 ║\033[0m")
-                        print(f"\033[93m╠══════════════════════════════════════════════════════════════╣\033[0m")
-                        print(f"\033[93m║  System: {system_end}, Beacons: {num_beacons}, Current turn: {current_count}       \033[0m")
-                        print(f"\033[93m║  当前轮次keep_indices(物理位置): {keep_indices[current_start_in_keep:current_start_in_keep+5].tolist()} ... \033[0m")
-                        print(f"\033[93m║  当前轮次target_pos(目标位置):   {target_pos[current_start_in_keep:current_start_in_keep+5].tolist()} ... \033[0m")
-                        print(f"\033[93m║  当前轮次delta值:               {delta[current_start_in_keep:current_start_in_keep+5].tolist()} ... \033[0m")
-                        print(f"\033[93m╠══════════════════════════════════════════════════════════════╣\033[0m")
-                        if torch.any(delta[current_start_in_keep:] != 0):
-                            print(f"\033[91m║  ⚠️  WARNING: 当前轮次delta非零！                             \033[0m")
-                            print(f"\033[91m║  Forward阶段已用NEW position_ids计算RoPE (如13,14,15...)     \033[0m")
-                            print(f"\033[91m║  Compress阶段又用delta修正RoPE (delta = 13-202 = -189 等)   \033[0m")
-                            print(f"\033[91m║  >>> 这会导致RoPE被双重应用，K states被破坏！               \033[0m")
-                        else:
-                            print(f"\033[92m║  ✓ 当前轮次delta为0，RoPE没有被双重修正                      \033[0m")
-                        print(f"\033[93m╚══════════════════════════════════════════════════════════════╝\033[0m")
+                    # DEBUG：验证修复（注释掉减少输出噪音）
+                    # if layer_idx == 0 and b == 0:
+                    #     print(f"\033[92m[RoPE修复] 跳过RoPE修正 - Forward已用正确position_ids\033[0m")
 
-                    delta_input = delta.unsqueeze(0)
-                    cos, sin = self.rotary_emb(v_chunk, position_ids=delta_input)
-
-                    k_chunk_unsqueezed = k_chunk.unsqueeze(0)
-                    _, k_chunk_corrected = apply_rotary_pos_emb(
-                        k_chunk_unsqueezed, k_chunk_unsqueezed, cos, sin
-                    )
-                    k_chunk = k_chunk_corrected.squeeze(0)
+                    # 不再对K应用RoPE修正，因为Forward阶段已经使用了正确的position_ids
 
                     # Padding处理
                     if keep_count < max_keep_len:
@@ -1088,20 +1069,11 @@ class Qwen3Model(Qwen3PreTrainedModel):
             position_ids = torch.stack(new_position_ids_list, dim=0)
             cache_position = position_ids[0]  # cache_position取第一个batch的
 
-            # DEBUG RoPE验证：打印位置重映射信息
-            if batch_size > 0 and len(qa_segments) > 0 and len(qa_segments[0]) > 0:
-                beacon_idx = torch.nonzero(beacon_positions[0], as_tuple=False).squeeze(-1)
-                if beacon_idx.numel() > 0:
-                    last_beacon = beacon_idx[-1].item()
-                    current_turn_start_phys = last_beacon + 1
-                    print(f"\033[96m╔══════════════════════════════════════════════════════════════╗\033[0m")
-                    print(f"\033[96m║  [RoPE验证 - Forward阶段] Position Remapping                 ║\033[0m")
-                    print(f"\033[96m╠══════════════════════════════════════════════════════════════╣\033[0m")
-                    print(f"\033[96m║  Seq_len: {seq_len}, System_end: {qa_segments[0][0][0]}, Beacons: {len(beacon_idx)}          \033[0m")
-                    print(f"\033[96m║  当前轮次物理位置: {current_turn_start_phys} ~ {seq_len-1}                          \033[0m")
-                    print(f"\033[96m║  当前轮次 NEW position_ids: {position_ids[0][current_turn_start_phys:current_turn_start_phys+5].tolist()} ... \033[0m")
-                    print(f"\033[96m║  >>> 这些是RoPE使用的位置！KV cache存储的K带有这些位置的RoPE  \033[0m")
-                    print(f"\033[96m╚══════════════════════════════════════════════════════════════╝\033[0m")
+            # DEBUG: 简化的位置重映射信息
+            # if batch_size > 0 and len(qa_segments) > 0 and len(qa_segments[0]) > 0:
+            #     beacon_idx = torch.nonzero(beacon_positions[0], as_tuple=False).squeeze(-1)
+            #     if beacon_idx.numel() > 0:
+            #         print(f"\033[96m[Forward] Position remapped: {len(beacon_idx)} beacons, current turn uses pos {qa_segments[0][0][0] + len(beacon_idx)}+\033[0m")
 
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
