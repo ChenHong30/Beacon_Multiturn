@@ -273,6 +273,8 @@ class Qwen3Attention(nn.Module):
         self.k_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # thus post q_norm does not need reshape
         
         # Beacon token的独立QKV投影矩阵
+        # 注意：这里先用零初始化，在from_pretrained()中会检查missing_keys后再决定是否从原始投影复制
+        # 这样可以避免从checkpoint恢复时覆盖已训练的beacon权重
         self.beacon_q_proj = nn.Linear(
             config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
         )
@@ -286,23 +288,61 @@ class Qwen3Attention(nn.Module):
         self.beacon_q_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.beacon_k_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
-        # 使用原始投影矩阵的权重初始化beacon投影矩阵 (Warm Start)
+        # 先用零初始化beacon参数，避免随机初始化导致的不稳定
+        # 实际初始化会在from_pretrained()中根据missing_keys决定
         with torch.no_grad():
-            self.beacon_q_proj.weight.copy_(self.q_proj.weight)
-            self.beacon_k_proj.weight.copy_(self.k_proj.weight)
-            self.beacon_v_proj.weight.copy_(self.v_proj.weight)
-            if self.beacon_q_proj.bias is not None and self.q_proj.bias is not None:
-                self.beacon_q_proj.bias.copy_(self.q_proj.bias)
-            if self.beacon_k_proj.bias is not None and self.k_proj.bias is not None:
-                self.beacon_k_proj.bias.copy_(self.k_proj.bias)
-            if self.beacon_v_proj.bias is not None and self.v_proj.bias is not None:
-                self.beacon_v_proj.bias.copy_(self.v_proj.bias)
-            
-            # Copy Norm weights
-            self.beacon_q_norm.weight.copy_(self.q_norm.weight)
-            self.beacon_k_norm.weight.copy_(self.k_norm.weight)
-                
+            self.beacon_q_proj.weight.data.zero_()
+            self.beacon_k_proj.weight.data.zero_()
+            self.beacon_v_proj.weight.data.zero_()
+            if self.beacon_q_proj.bias is not None:
+                self.beacon_q_proj.bias.data.zero_()
+            if self.beacon_k_proj.bias is not None:
+                self.beacon_k_proj.bias.data.zero_()
+            if self.beacon_v_proj.bias is not None:
+                self.beacon_v_proj.bias.data.zero_()
+        # 标记为已初始化，防止post_init()再次初始化
+        self.beacon_q_proj._is_hf_initialized = True
+        self.beacon_k_proj._is_hf_initialized = True
+        self.beacon_v_proj._is_hf_initialized = True
+        self.beacon_q_norm._is_hf_initialized = True
+        self.beacon_k_norm._is_hf_initialized = True
+
         self.sliding_window = config.sliding_window if self.layer_type == "sliding_attention" else None
+
+    def _init_beacon_proj(self, missing_keys):
+        """
+        Initialize beacon projection weights from original projections.
+        Only called when beacon weights are missing (not loaded from checkpoint).
+
+        Args:
+            missing_keys: List of missing keys from model loading
+        """
+        # 只有当beacon权重缺失时才从原始投影复制
+        if any("beacon_q_proj" in key for key in missing_keys):
+            with torch.no_grad():
+                self.beacon_q_proj.weight.data.copy_(self.q_proj.weight.data)
+                if self.beacon_q_proj.bias is not None and self.q_proj.bias is not None:
+                    self.beacon_q_proj.bias.data.copy_(self.q_proj.bias.data)
+
+        if any("beacon_k_proj" in key for key in missing_keys):
+            with torch.no_grad():
+                self.beacon_k_proj.weight.data.copy_(self.k_proj.weight.data)
+                if self.beacon_k_proj.bias is not None and self.k_proj.bias is not None:
+                    self.beacon_k_proj.bias.data.copy_(self.k_proj.bias.data)
+
+        if any("beacon_v_proj" in key for key in missing_keys):
+            with torch.no_grad():
+                self.beacon_v_proj.weight.data.copy_(self.v_proj.weight.data)
+                if self.beacon_v_proj.bias is not None and self.v_proj.bias is not None:
+                    self.beacon_v_proj.bias.data.copy_(self.v_proj.bias.data)
+
+        if any("beacon_q_norm" in key for key in missing_keys):
+            with torch.no_grad():
+                self.beacon_q_norm.weight.data.copy_(self.q_norm.weight.data)
+
+        if any("beacon_k_norm" in key for key in missing_keys):
+            with torch.no_grad():
+                self.beacon_k_norm.weight.data.copy_(self.k_norm.weight.data)
 
     def forward(
         self,
@@ -697,6 +737,12 @@ class Qwen3Model(Qwen3PreTrainedModel):
         - 历史轮次的body (Q1, A1, Q2, A2) 被丢弃，只保留其beacon表示
         - System和当前轮次Q3完整保留
 
+        RoPE修正 (2024-12 修复):
+        - 训练时位置自然连续，压缩后丢弃body，需要对K进行RoPE修正
+        - System: 位置不变，不需要修正
+        - Beacons: 原位置分散，需要重映射为连续位置
+        - 当前轮次: 原位置在最后，需要紧接beacons
+
         支持Batch > 1，会自动处理不同样本长度不一致的情况（进行padding）。
         """
         if past_key_values is None or not torch.any(beacon_positions):
@@ -717,11 +763,12 @@ class Qwen3Model(Qwen3PreTrainedModel):
         device = key_cache_list[0].device
         dtype = key_cache_list[0].dtype
         kv_seq_len = key_cache_list[0].shape[2]
+        head_dim = key_cache_list[0].shape[3]
 
-        # 1. 计算每个样本需要保留的索引：System + beacon positions + 当前轮次
+        # 1. 计算每个样本需要保留的索引和位置映射
         batch_keep_indices = []
-        batch_system_ends = []  # 保存每个batch的system_end，用于RoPE修正
-        batch_num_beacons = []  # 保存每个batch的beacon数量
+        batch_orig_positions = []  # 原始位置（用于RoPE反转）
+        batch_target_positions = []  # 目标位置（用于RoPE重新应用）
         max_keep_len = 0
 
         for b in range(batch_size):
@@ -732,13 +779,11 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 beacon_indices = beacon_indices.unsqueeze(0)
 
             if len(beacon_indices) > 0:
-                # === 修复：保留System tokens ===
-                # System范围：从0到第一个历史segment的开始位置之前
-                # 通过qa_segments获取第一个历史segment的开始位置
-                system_end = 0  # 默认没有system
+                # System范围
+                system_end = 0
                 if qa_segments is not None and len(qa_segments) > b and len(qa_segments[b]) > 0:
-                    first_segment_start = qa_segments[b][0][0]  # 第一个segment的开始位置
-                    system_end = first_segment_start  # system是0到first_segment_start-1
+                    first_segment_start = qa_segments[b][0][0]
+                    system_end = first_segment_start
 
                 if system_end > 0:
                     system_indices = torch.arange(0, system_end, device=device)
@@ -747,25 +792,45 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
                 # 最后一个beacon的位置
                 last_beacon_pos = beacon_indices[-1].item()
-                # 当前轮次的范围：最后一个beacon之后到序列末尾
+                # 当前轮次的范围
                 current_turn_start = last_beacon_pos + 1
                 current_turn_end = min(seq_len, kv_seq_len)
 
                 # 当前轮次的索引
                 if current_turn_start < current_turn_end:
                     current_turn_indices = torch.arange(current_turn_start, current_turn_end, device=device)
-                    # 合并：System + beacon indices + current turn indices
                     keep_indices = torch.cat([system_indices, beacon_indices, current_turn_indices])
                 else:
+                    current_turn_indices = torch.tensor([], dtype=torch.long, device=device)
                     keep_indices = torch.cat([system_indices, beacon_indices])
 
-                batch_system_ends.append(system_end)
-                batch_num_beacons.append(len(beacon_indices))
+                num_beacons = len(beacon_indices)
+                num_current_turn = len(current_turn_indices)
+
+                # 计算原始位置和目标位置
+                orig_positions = keep_indices.clone()  # 原始位置就是keep_indices
+
+                # 目标位置：System(0~system_end-1) + Beacons(system_end~system_end+num_beacons-1) + Current(system_end+num_beacons~...)
+                target_positions = torch.zeros_like(keep_indices)
+                # System部分：位置不变
+                target_positions[:system_end] = torch.arange(system_end, device=device)
+                # Beacon部分：紧接System
+                target_positions[system_end:system_end + num_beacons] = torch.arange(
+                    system_end, system_end + num_beacons, device=device
+                )
+                # Current turn部分：紧接Beacons
+                if num_current_turn > 0:
+                    target_positions[system_end + num_beacons:] = torch.arange(
+                        system_end + num_beacons, system_end + num_beacons + num_current_turn, device=device
+                    )
+
+                batch_orig_positions.append(orig_positions)
+                batch_target_positions.append(target_positions)
             else:
                 # 没有beacon，保留所有（不压缩）
                 keep_indices = torch.arange(min(seq_len, kv_seq_len), device=device)
-                batch_system_ends.append(0)
-                batch_num_beacons.append(0)
+                batch_orig_positions.append(keep_indices.clone())
+                batch_target_positions.append(keep_indices.clone())
 
             batch_keep_indices.append(keep_indices)
             max_keep_len = max(max_keep_len, len(keep_indices))
@@ -773,7 +838,22 @@ class Qwen3Model(Qwen3PreTrainedModel):
         if max_keep_len == 0:
             return past_key_values
 
-        # 2. 准备新的Cache容器
+        # 2. 预计算RoPE的cos和sin（用于修正）
+        # 获取最大可能的位置
+        max_orig_pos = max(pos.max().item() if len(pos) > 0 else 0 for pos in batch_orig_positions)
+        max_target_pos = max(pos.max().item() if len(pos) > 0 else 0 for pos in batch_target_positions)
+        max_pos = max(max_orig_pos, max_target_pos) + 1
+
+        # 计算所有可能位置的cos和sin
+        position_ids_for_rope = torch.arange(max_pos, device=device).unsqueeze(0)
+        cos_all, sin_all = self.rotary_emb(
+            torch.zeros(1, max_pos, head_dim, device=device, dtype=dtype),
+            position_ids_for_rope
+        )  # [1, max_pos, head_dim]
+        cos_all = cos_all.squeeze(0)  # [max_pos, head_dim]
+        sin_all = sin_all.squeeze(0)
+
+        # 3. 准备新的Cache容器
         compressed_cache = DynamicCache()
         num_layers = len(key_cache_list)
 
@@ -782,57 +862,71 @@ class Qwen3Model(Qwen3PreTrainedModel):
             original_value = value_cache_list[layer_idx]
 
             num_heads = original_key.shape[1]
-            head_dim = original_key.shape[3]
 
             new_key_list = []
             new_value_list = []
 
             for b in range(batch_size):
                 keep_indices = batch_keep_indices[b]
+                orig_positions = batch_orig_positions[b]
+                target_positions = batch_target_positions[b]
                 keep_count = len(keep_indices)
-                system_end = batch_system_ends[b]
-                num_beacons = batch_num_beacons[b]
 
                 if keep_count > 0:
                     # 提取需要保留的KV
                     k_chunk = original_key[b, :, keep_indices, :]  # [num_heads, keep_count, head_dim]
                     v_chunk = original_value[b, :, keep_indices, :]
 
-                    # === RoPE 修正逻辑（与训练时的位置映射一致）===
-                    # 目标位置分配：
-                    # - System tokens (前system_end个): 保持0, 1, ..., system_end-1
-                    # - Beacon tokens (接下来num_beacons个): system_end, system_end+1, ...
-                    # - Current turn tokens (剩余): system_end+num_beacons, system_end+num_beacons+1, ...
-                    target_pos = torch.zeros(keep_count, dtype=torch.long, device=device)
+                    # === RoPE 修正 (2024-12 修复) ===
+                    # K已经带有原始位置的RoPE编码，需要：
+                    # 1. 反转原始RoPE: K_no_rope = inverse_rope(K, orig_pos)
+                    # 2. 应用新RoPE: K_new = apply_rope(K_no_rope, target_pos)
 
-                    # System部分：保持原位置
-                    for i in range(system_end):
-                        target_pos[i] = i
+                    # 获取原始和目标位置的cos/sin
+                    cos_orig = cos_all[orig_positions]  # [keep_count, head_dim]
+                    sin_orig = sin_all[orig_positions]
+                    cos_target = cos_all[target_positions]
+                    sin_target = sin_all[target_positions]
 
-                    # Beacon部分
-                    for i in range(num_beacons):
-                        target_pos[system_end + i] = system_end + i
+                    # 反转原始RoPE: K_no_rope = K * cos_orig + rotate_half(K) * (-sin_orig)
+                    # 注意：原始RoPE是 K_rope = K * cos + rotate_half(K) * sin
+                    # 所以反转是 K = K_rope * cos - rotate_half(K_rope) * sin (近似，实际需要精确反转)
+                    # 精确反转: K = (K_rope * cos + rotate_half(K_rope) * sin) / (cos^2 + sin^2) = K_rope * cos + rotate_half(K_rope) * sin (因为cos^2+sin^2=1)
+                    # 但rotate_half的逆是rotate_half本身，所以：
+                    # K = K_rope * cos - rotate_half(K_rope) * sin
 
-                    # Current turn部分
-                    current_turn_count = keep_count - system_end - num_beacons
-                    current_turn_new_start = system_end + num_beacons
-                    for i in range(current_turn_count):
-                        target_pos[system_end + num_beacons + i] = current_turn_new_start + i
+                    # 为了正确处理，我们使用组合变换：
+                    # K_new = K_old * cos(target-orig) + rotate_half(K_old) * sin(target-orig)
+                    # 这等价于先反转再应用新位置
 
-                    # === RoPE 修正逻辑 ===
-                    # 关键洞察：Forward阶段已经对position_ids进行了重映射！
-                    # - System tokens: position_ids = 0~system_end-1 (与物理位置相同)
-                    # - Beacon tokens: position_ids = system_end, system_end+1, ... (重映射后)
-                    # - Current turn: position_ids = system_end+num_beacons, ... (重映射后)
-                    #
-                    # 因此KV cache中的K已经带有正确的RoPE，不需要再修正！
+                    # 计算位置差的cos和sin
+                    pos_diff = target_positions - orig_positions  # [keep_count]
+                    # 只对需要修正的位置（pos_diff != 0）进行RoPE修正
+                    needs_correction = (pos_diff != 0)
+
+                    if needs_correction.any():
+                        # 使用角度差计算: cos(target)*cos(orig) + sin(target)*sin(orig) = cos(target-orig)
+                        #                sin(target)*cos(orig) - cos(target)*sin(orig) = sin(target-orig)
+                        cos_diff = cos_target * cos_orig + sin_target * sin_orig  # [keep_count, head_dim]
+                        sin_diff = sin_target * cos_orig - cos_target * sin_orig
+
+                        # 扩展维度以匹配k_chunk: [num_heads, keep_count, head_dim]
+                        cos_diff = cos_diff.unsqueeze(0)  # [1, keep_count, head_dim]
+                        sin_diff = sin_diff.unsqueeze(0)
+
+                        # 应用RoPE修正
+                        k_corrected = k_chunk * cos_diff + rotate_half(k_chunk) * sin_diff
+                        k_chunk = k_corrected
 
                     # DEBUG：验证压缩后的结构
                     if layer_idx == 0 and b == 0:
-                        print(f"\033[92m[Compress Debug] System: {system_end}, Beacons: {num_beacons}, Current turn: {current_turn_count}\033[0m")
-                        print(f"\033[92m[Compress Debug] Total keep_count: {keep_count} = {system_end} + {num_beacons} + {current_turn_count}\033[0m")
-
-                    # 不再对K应用RoPE修正，因为Forward阶段已经使用了正确的position_ids
+                        num_system = (target_positions < (batch_orig_positions[b][0] if len(batch_orig_positions[b]) > 0 else 0)).sum().item() if qa_segments and len(qa_segments[b]) > 0 else 0
+                        # 简化：直接从qa_segments获取
+                        system_end = qa_segments[b][0][0] if (qa_segments and len(qa_segments) > b and len(qa_segments[b]) > 0) else 0
+                        num_beacons = beacon_positions[b].sum().item()
+                        num_current = keep_count - system_end - num_beacons
+                        print(f"\033[92m[Compress] System: {system_end}, Beacons: {num_beacons}, Current: {num_current}, Total: {keep_count}\033[0m")
+                        print(f"\033[92m[Compress] RoPE corrected: {needs_correction.sum().item()} positions\033[0m")
 
                     # Padding处理
                     if keep_count < max_keep_len:
@@ -852,23 +946,8 @@ class Qwen3Model(Qwen3PreTrainedModel):
             new_value_batch = torch.stack(new_value_list, dim=0)
             compressed_cache.update(new_key_batch, new_value_batch, layer_idx)
 
-        # 计算压缩后的长度（供生成阶段使用）
-        compressed_len = compressed_cache.get_seq_length()
-
-        # # Debug info
-        # original_len = past_key_values.get_seq_length()
-        # num_beacons = beacon_positions.sum().item()
-
-        # # 详细DEBUG信息
-        # print(f"\033[95m[DEBUG compress_kv_cache] Original KV len: {original_len}, Compressed len: {compressed_len}\033[0m")
-        # print(f"\033[95m[DEBUG compress_kv_cache] Beacons: {num_beacons}, Current turn tokens: {compressed_len - num_beacons}\033[0m")
-        # if batch_keep_indices:
-        #     sample_indices = batch_keep_indices[0]
-        #     if len(sample_indices) > 0:
-        #         print(f"\033[95m[DEBUG compress_kv_cache] keep_indices (first 5): {sample_indices[:5].tolist()}\033[0m")
-        #         print(f"\033[95m[DEBUG compress_kv_cache] keep_indices (last 5): {sample_indices[-5:].tolist()}\033[0m")
-
         # 保存压缩后的长度，供生成阶段使用
+        compressed_len = compressed_cache.get_seq_length()
         self._compressed_seq_length = compressed_len
 
         return compressed_cache
@@ -1054,74 +1133,13 @@ class Qwen3Model(Qwen3PreTrainedModel):
                                 if "sliding_attention" in causal_mask_mapping and causal_mask_mapping["sliding_attention"] is not None:
                                     causal_mask_mapping["sliding_attention"][b, 0, beacon_i, beacon_j] = 0.0
 
-        # === 方案1核心：训练时模拟压缩后的位置配置 ===
-        # 当有beacon时，重新计算position_ids使其模拟压缩后的位置分布
-        # 这样训练和推理时的相对位置关系保持一致
-        if qa_segments is not None and beacon_positions is not None and torch.any(beacon_positions):
-            batch_size = inputs_embeds.shape[0]
-            seq_len = inputs_embeds.shape[1]
-            device = inputs_embeds.device
-
-            # 为每个batch计算新的position_ids
-            new_position_ids_list = []
-            for b in range(batch_size):
-                if len(qa_segments) > b and len(qa_segments[b]) > 0:
-                    # 获取system的结束位置（第一个历史segment的开始位置）
-                    system_end = qa_segments[b][0][0]
-
-                    # 获取beacon位置
-                    beacon_indices = torch.nonzero(beacon_positions[b], as_tuple=False).squeeze(-1)
-                    if beacon_indices.dim() == 0:
-                        beacon_indices = beacon_indices.unsqueeze(0)
-                    num_beacons = len(beacon_indices)
-
-                    # 获取当前轮次的开始位置（最后一个beacon之后）
-                    if num_beacons > 0:
-                        current_turn_start = beacon_indices[-1].item() + 1
-                    else:
-                        current_turn_start = system_end
-
-                    # 创建新的position_ids映射
-                    # 原始位置 -> 压缩后位置
-                    new_pos = torch.zeros(seq_len, dtype=torch.long, device=device)
-
-                    # System tokens: 保持原位置 0, 1, ..., system_end-1
-                    for i in range(system_end):
-                        new_pos[i] = i
-
-                    # Beacon tokens: 紧接system之后 system_end, system_end+1, ...
-                    for idx, beacon_pos in enumerate(beacon_indices.tolist()):
-                        new_pos[beacon_pos] = system_end + idx
-
-                    # 当前轮次: 紧接beacons之后
-                    current_turn_new_start = system_end + num_beacons
-                    for i, orig_pos in enumerate(range(current_turn_start, seq_len)):
-                        new_pos[orig_pos] = current_turn_new_start + i
-
-                    # 历史body位置：保持原始位置，这样 beacon 能正确 attend 到 body
-                    # 虽然 body 对后续 tokens 被 mask 了，但 beacon 需要看到 body 来压缩信息
-                    # 保持原始位置确保 RoPE 编码正确，beacon 能区分 body 中不同位置的 token
-                    for seg_idx, (seg_start, beacon_pos) in enumerate(qa_segments[b]):
-                        first_beacon_of_seg = beacon_pos - 15  # 该 segment 第一个 beacon 的位置
-                        # body 范围: [seg_start, first_beacon_of_seg)
-                        for orig_pos in range(seg_start, first_beacon_of_seg):
-                            # 保持原始位置，让 beacon 能通过 RoPE 正确区分 body 中的不同 token
-                            new_pos[orig_pos] = orig_pos
-
-                    new_position_ids_list.append(new_pos)
-                else:
-                    # 没有qa_segments，保持原始位置
-                    new_position_ids_list.append(torch.arange(seq_len, dtype=torch.long, device=device))
-
-            # 组合成batch
-            position_ids = torch.stack(new_position_ids_list, dim=0)
-            cache_position = position_ids[0]  # cache_position取第一个batch的
-
-            # DEBUG: 简化的位置重映射信息
-            # if batch_size > 0 and len(qa_segments) > 0 and len(qa_segments[0]) > 0:
-            #     beacon_idx = torch.nonzero(beacon_positions[0], as_tuple=False).squeeze(-1)
-            #     if beacon_idx.numel() > 0:
-            #         print(f"\033[96m[Forward] Position remapped: {len(beacon_idx)} beacons, current turn uses pos {qa_segments[0][0][0] + len(beacon_idx)}+\033[0m")
+        # === 位置编码策略 (2024-12 修复) ===
+        # 不做position_ids重映射，让位置自然连续递增：
+        # System(0~N) → Body1(N+1~M) → Beacons1(M+1~M+16) → Body2 → Beacons2 → ... → 当前轮次
+        # 这样beacon和其压缩的body tokens位置连续，RoPE能正确编码相对距离。
+        #
+        # 注意：推理阶段compress_kv_cache()会丢弃body只保留beacons，
+        # 需要在那里对K进行RoPE修正以确保压缩后位置连续。
 
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
@@ -1316,13 +1334,44 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
     @classmethod
     def from_pretrained(cls, *args, **kwargs):
         """
-        重写from_pretrained方法，在加载预训练权重后初始化beacon相关参数
-        """
-        # 调用父类的from_pretrained方法
-        model = super().from_pretrained(*args, **kwargs)
+        重写from_pretrained方法，在加载预训练权重后初始化beacon相关参数。
 
-        # 初始化 beacon_embedding 和 beacon_position_embedding
-        model.model.extend_embeddings_for_beacon()
+        初始化时机修复 (2024-12):
+        - 检查 missing_keys 来决定是否需要初始化beacon参数
+        - 如果从包含beacon权重的checkpoint加载，则不覆盖已训练的权重
+        - 如果是首次从基础模型加载，则从原始投影矩阵复制权重进行warm start
+        """
+        # 请求返回loading_info以获取missing_keys
+        kwargs.update(output_loading_info=True)
+
+        # 调用父类的from_pretrained方法
+        result = super().from_pretrained(*args, **kwargs)
+
+        # 解析返回值
+        if isinstance(result, tuple):
+            model, loading_info = result
+        else:
+            model = result
+            loading_info = {"missing_keys": []}
+
+        missing_keys = loading_info.get("missing_keys", [])
+
+        # 只有当beacon相关权重缺失时才初始化
+        # 这确保从已训练的beacon checkpoint恢复时不会覆盖权重
+        has_missing_beacon_keys = any("beacon" in key for key in missing_keys)
+
+        if has_missing_beacon_keys:
+            # 初始化 beacon_embedding 和 beacon_position_embedding
+            model.model.extend_embeddings_for_beacon()
+
+            # 初始化每层的beacon投影矩阵
+            for layer in model.model.layers:
+                if hasattr(layer.self_attn, '_init_beacon_proj'):
+                    layer.self_attn._init_beacon_proj(missing_keys)
+
+            print(f"\033[93m[from_pretrained] Initialized beacon parameters from original projections (warm start)\033[0m")
+        else:
+            print(f"\033[92m[from_pretrained] Loaded beacon parameters from checkpoint (no re-initialization)\033[0m")
 
         # 确保beacon投影矩阵和beacon_embedding的数据类型与模型一致
         target_dtype = model.model.embed_tokens.weight.dtype
@@ -1344,6 +1393,9 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                 layer.self_attn.beacon_q_proj = layer.self_attn.beacon_q_proj.to(dtype=target_dtype, device=target_device)
                 layer.self_attn.beacon_k_proj = layer.self_attn.beacon_k_proj.to(dtype=target_dtype, device=target_device)
                 layer.self_attn.beacon_v_proj = layer.self_attn.beacon_v_proj.to(dtype=target_dtype, device=target_device)
+            if hasattr(layer.self_attn, 'beacon_q_norm'):
+                layer.self_attn.beacon_q_norm = layer.self_attn.beacon_q_norm.to(dtype=target_dtype, device=target_device)
+                layer.self_attn.beacon_k_norm = layer.self_attn.beacon_k_norm.to(dtype=target_dtype, device=target_device)
 
         return model
 
