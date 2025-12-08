@@ -541,9 +541,14 @@ class Qwen3Model(Qwen3PreTrainedModel):
         self.beacon_token_id = self.vocab_size
         self.beacon_embedding = nn.Parameter(torch.empty(config.hidden_size))
 
-        # === 16 Beacons 增强：Learnable Position Embedding ===
-        # 每个 beacon 位置有独立的可学习 embedding，帮助模型区分 16 个 beacons 的角色
-        self.num_beacons_per_segment = 16
+        # === Beacons 增强：Learnable Position Embedding ===
+        # 每个 beacon 位置有独立的可学习 embedding，帮助模型区分不同 beacons 的角色
+        # 从 config 读取 beacon 数量
+        self.num_beacons_per_segment = getattr(config, 'num_beacons_per_segment', 16)
+        # 如果config中没有设置，且getattr默认值也未生效(理论上不会)，则报错
+        if self.num_beacons_per_segment is None:
+            raise ValueError("num_beacons_per_segment must be specified in config")
+            
         self.beacon_position_embedding = nn.Parameter(
             torch.zeros(self.num_beacons_per_segment, config.hidden_size)
         )
@@ -590,8 +595,8 @@ class Qwen3Model(Qwen3PreTrainedModel):
         - 当前用户的问题（最后一个user消息）不压缩
 
         例如：System + U1 + A1 + U2 + A2 + U3 (当前问题)
-        会变成：System + B1 + B2 + B3 + B4 + U3
-        其中 B1=U1的beacon, B2=A1的beacon, B3=U2的beacon, B4=A2的beacon
+        会变成：System + [B_U1] + [B_A1] + [B_U2] + [B_A2] + U3
+        其中 [B_U1] 表示 U1 的 beacon 序列 (长度为 num_beacons_per_segment)
 
         Returns:
             qa_segments: 每个QA轮次的起始和结束位置列表
@@ -685,8 +690,8 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
                 # 只在历史消息（非system，且在最后一个user之前）后添加beacon
                 if i in history_messages:
-                    # Ablation: Insert 16 beacon tokens
-                    for _ in range(16):
+                    # Insert beacon tokens (数量由 config 指定)
+                    for _ in range(self.num_beacons_per_segment):
                         modified_ids.append(self.beacon_token_id)
                         beacon_pos.append(1)  # 标记这是beacon token位置
                         if labels is not None and modified_label_ids is not None:
@@ -762,8 +767,8 @@ class Qwen3Model(Qwen3PreTrainedModel):
         压缩KV cache，保留 System + beacon tokens + 当前轮次的所有token。
 
         压缩逻辑：
-        - 输入: System + Q1 + A1 + B1 + Q2 + A2 + B2 + Q3 (当前query)
-        - 输出: System + B1 + B2 + Q3
+        - 输入: System + Q1 + A1 + [Beacons] + Q2 + A2 + [Beacons] + Q3 (当前query)
+        - 输出: System + [Beacons] + [Beacons] + Q3
         - 历史轮次的body (Q1, A1, Q2, A2) 被丢弃，只保留其beacon表示
         - System和当前轮次Q3完整保留
 
@@ -972,16 +977,16 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 safe_input_ids[beacon_mask] = 0
                 inputs_embeds = self.embed_tokens(safe_input_ids)
 
-                # === 16 Beacons 增强：为每个 beacon 添加独特的 position embedding ===
+                # === Beacons 增强：为每个 beacon 添加独特的 position embedding ===
                 # beacon_embedding 是共享的基础 embedding
-                # beacon_position_embedding 根据 beacon 在 segment 内的位置（0-15）添加
+                # beacon_position_embedding 根据 beacon 在 segment 内的位置添加
                 batch_size, seq_len = input_ids.shape
                 for b in range(batch_size):
                     beacon_indices = torch.nonzero(beacon_mask[b], as_tuple=False).squeeze(-1)
                     if beacon_indices.numel() > 0:
-                        # 每 16 个 beacons 为一组（对应一个 segment）
+                        # 每 num_beacons_per_segment 个 beacons 为一组（对应一个 segment）
                         for i, idx in enumerate(beacon_indices.tolist()):
-                            pos_in_segment = i % self.num_beacons_per_segment  # 0-15
+                            pos_in_segment = i % self.num_beacons_per_segment
                             # 基础 embedding + 位置 embedding
                             inputs_embeds[b, idx] = self.beacon_embedding + self.beacon_position_embedding[pos_in_segment]
             else:
@@ -1050,12 +1055,12 @@ class Qwen3Model(Qwen3PreTrainedModel):
             for b, segments in enumerate(qa_segments):
                 for (start_i, end_i) in segments:
                     # start_i: 段落开始
-                    # end_i: 最后一个 beacon (B16) 的位置
-                    # B1 的位置: end_i - 15
-                    # Body 范围: [start_i, end_i - 15) (不包含 beacons)
+                    # end_i: 最后一个 beacon 的位置
+                    # 第一个 beacon 的位置: end_i - (num_beacons_per_segment - 1)
+                    # Body 范围: [start_i, first_beacon) (不包含 beacons)
 
-                    first_beacon = end_i - 15  # B1 的位置
-                    last_beacon = end_i        # B16 的位置
+                    first_beacon = end_i - (self.num_beacons_per_segment - 1)  # 第一个 beacon 的位置
+                    last_beacon = end_i  # 最后一个 beacon 的位置
 
                     # 只有当Body非空时才需要遮蔽
                     if start_i < first_beacon:
@@ -1067,15 +1072,15 @@ class Qwen3Model(Qwen3PreTrainedModel):
                             if "sliding_attention" in causal_mask_mapping and causal_mask_mapping["sliding_attention"] is not None:
                                 causal_mask_mapping["sliding_attention"][b, 0, end_i + 1:, start_i : first_beacon] = min_val
 
-                        # 2. === 关键修复：让同一 segment 内的 16 个 beacons 能双向 attend ===
+                        # 2. === 关键修复：让同一 segment 内的 beacons 能双向 attend ===
                         # 在 causal mask 中，后面的 beacon 已经能看到前面的 beacon
                         # 我们需要让前面的 beacon 也能看到后面的 beacon（打破 causal 约束）
-                        # 这样所有 16 个 beacons 都能获得完整信息，协作压缩
-                        for i in range(16):
+                        # 这样所有 beacons 都能获得完整信息，协作压缩
+                        for i in range(self.num_beacons_per_segment):
                             beacon_i = first_beacon + i
                             if beacon_i >= seq_len:
                                 break
-                            for j in range(i + 1, 16):  # 让 beacon_i 能看到后面的 beacon_j
+                            for j in range(i + 1, self.num_beacons_per_segment):  # 让 beacon_i 能看到后面的 beacon_j
                                 beacon_j = first_beacon + j
                                 if beacon_j >= seq_len:
                                     break
@@ -1087,7 +1092,8 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
         # === 位置编码策略 (2024-12 修复) ===
         # 不做position_ids重映射，让位置自然连续递增：
-        # System(0~N) → Body1(N+1~M) → Beacons1(M+1~M+16) → Body2 → Beacons2 → ... → 当前轮次
+        # System(0~N) → Body1(N+1~M) → Beacons1(M+1~M+K) → Body2 → Beacons2 → ... → 当前轮次
+        # 其中 K = num_beacons_per_segment
         # 这样beacon和其压缩的body tokens位置连续，RoPE能正确编码相对距离。
         #
         # 注意：推理阶段compress_kv_cache()会丢弃body只保留beacons，

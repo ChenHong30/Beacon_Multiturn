@@ -180,6 +180,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable gradient checkpointing to lower activation memory usage.",
     )
+    parser.add_argument(
+        "--num-beacons",
+        type=int,
+        default=16,
+        help="Number of beacon tokens to insert per historical segment (default: 16).",
+    )
     args = parser.parse_args()
 
     if args.fp16 and args.bf16:
@@ -633,6 +639,10 @@ def main() -> None:
         )
 
         config = AutoConfig.from_pretrained(args.model_path, trust_remote_code=True)
+
+        # 设置 beacon token 数量
+        config.num_beacons_per_segment = args.num_beacons
+        logger.info(f"Using {args.num_beacons} beacon tokens per segment")
 
         if config.model_type == "qwen2":
             model_cls = Qwen2ForCausalLM
