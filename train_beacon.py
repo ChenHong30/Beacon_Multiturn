@@ -663,6 +663,7 @@ def main() -> None:
         # 当通过 torchrun 或设置 CUDA_VISIBLE_DEVICES 启动时，Trainer 会自动识别并使用多卡
         model = model_cls.from_pretrained(
             args.model_path,
+            config=config,
             torch_dtype=torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else None),
             # 不使用 device_map，让 Trainer 管理设备分配
             device_map=None,
