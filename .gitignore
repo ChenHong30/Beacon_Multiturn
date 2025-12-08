@@ -6,3 +6,4 @@ runs
 *.json
 test.py
 *.md
+activation_beacon

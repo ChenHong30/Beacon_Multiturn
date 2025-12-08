@@ -656,6 +656,9 @@ def main() -> None:
             torch_dtype=torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else None),
             # 不使用 device_map，让 Trainer 管理设备分配
             device_map=None,
+            # 关键：强制使用 eager attention，确保自定义 beacon mask 正确应用
+            # FlashAttention 不支持复杂的自定义 attention mask
+            attn_implementation="eager",
         )
         model.config.use_cache = False
 

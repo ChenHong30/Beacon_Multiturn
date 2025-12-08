@@ -284,6 +284,10 @@ class Qwen3Attention(nn.Module):
         self.beacon_v_proj = nn.Linear(
             config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
         )
+        # Beacon Output Projection (following official activation_beacon implementation)
+        self.beacon_o_proj = nn.Linear(
+            config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
+        )
         # Independent Norms for Beacon (Crucial for Qwen3 Stability)
         self.beacon_q_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.beacon_k_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
@@ -294,16 +298,20 @@ class Qwen3Attention(nn.Module):
             self.beacon_q_proj.weight.data.zero_()
             self.beacon_k_proj.weight.data.zero_()
             self.beacon_v_proj.weight.data.zero_()
+            self.beacon_o_proj.weight.data.zero_()
             if self.beacon_q_proj.bias is not None:
                 self.beacon_q_proj.bias.data.zero_()
             if self.beacon_k_proj.bias is not None:
                 self.beacon_k_proj.bias.data.zero_()
             if self.beacon_v_proj.bias is not None:
                 self.beacon_v_proj.bias.data.zero_()
+            if self.beacon_o_proj.bias is not None:
+                self.beacon_o_proj.bias.data.zero_()
         # 标记为已初始化，防止post_init()再次初始化
         self.beacon_q_proj._is_hf_initialized = True
         self.beacon_k_proj._is_hf_initialized = True
         self.beacon_v_proj._is_hf_initialized = True
+        self.beacon_o_proj._is_hf_initialized = True
         self.beacon_q_norm._is_hf_initialized = True
         self.beacon_k_norm._is_hf_initialized = True
 
@@ -343,6 +351,12 @@ class Qwen3Attention(nn.Module):
         if any("beacon_k_norm" in key for key in missing_keys):
             with torch.no_grad():
                 self.beacon_k_norm.weight.data.copy_(self.k_norm.weight.data)
+
+        if any("beacon_o_proj" in key for key in missing_keys):
+            with torch.no_grad():
+                self.beacon_o_proj.weight.data.copy_(self.o_proj.weight.data)
+                if self.beacon_o_proj.bias is not None and self.o_proj.bias is not None:
+                    self.beacon_o_proj.bias.data.copy_(self.o_proj.bias.data)
 
     def forward(
         self,
@@ -414,7 +428,21 @@ class Qwen3Attention(nn.Module):
         )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        attn_output = self.o_proj(attn_output)
+
+        # 根据是否有beacon位置信息来决定使用哪套输出投影矩阵
+        if beacon_positions is not None:
+            # beacon tokens 使用 beacon_o_proj，普通 tokens 使用 o_proj
+            beacon_mask = beacon_positions  # [batch_size, seq_len]
+
+            ordinal_output = self.o_proj(attn_output)
+            beacon_output = self.beacon_o_proj(attn_output)
+
+            # 扩展 mask: [batch_size, seq_len] -> [batch_size, seq_len, hidden_size]
+            beacon_mask_expanded = beacon_mask.unsqueeze(-1).expand_as(ordinal_output)
+            attn_output = torch.where(beacon_mask_expanded, beacon_output, ordinal_output)
+        else:
+            attn_output = self.o_proj(attn_output)
+
         return attn_output, attn_weights
 
 
@@ -522,6 +550,8 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
         # 用于记录压缩后的 KV cache 长度，供生成阶段使用
         self._compressed_seq_length = None
+        # 用于记录压缩前的原始序列长度，供生成阶段计算 position_ids
+        self._original_seq_length = None
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -737,11 +767,11 @@ class Qwen3Model(Qwen3PreTrainedModel):
         - 历史轮次的body (Q1, A1, Q2, A2) 被丢弃，只保留其beacon表示
         - System和当前轮次Q3完整保留
 
-        RoPE修正 (2024-12 修复):
-        - 训练时位置自然连续，压缩后丢弃body，需要对K进行RoPE修正
-        - System: 位置不变，不需要修正
-        - Beacons: 原位置分散，需要重映射为连续位置
-        - 当前轮次: 原位置在最后，需要紧接beacons
+        重要设计决策 (2024-12 修正):
+        - 不做 RoPE 位置修正！保持原始位置编码
+        - 训练时: tokens 使用自然递增的位置
+        - 推理时: 保持相同的位置，生成的新 token 从原始序列长度继续
+        - 这样训练和推理时的相对位置距离完全一致
 
         支持Batch > 1，会自动处理不同样本长度不一致的情况（进行padding）。
         """
@@ -750,6 +780,9 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
         batch_size = beacon_positions.shape[0]
         seq_len = beacon_positions.shape[1]
+
+        # 保存原始序列长度（压缩前），用于生成阶段计算 position_ids
+        self._original_seq_length = seq_len
 
         # 兼容新旧版本的 DynamicCache API
         if hasattr(past_key_values, 'key_cache'):
@@ -765,10 +798,8 @@ class Qwen3Model(Qwen3PreTrainedModel):
         kv_seq_len = key_cache_list[0].shape[2]
         head_dim = key_cache_list[0].shape[3]
 
-        # 1. 计算每个样本需要保留的索引和位置映射
+        # 1. 计算每个样本需要保留的索引
         batch_keep_indices = []
-        batch_orig_positions = []  # 原始位置（用于RoPE反转）
-        batch_target_positions = []  # 目标位置（用于RoPE重新应用）
         max_keep_len = 0
 
         for b in range(batch_size):
@@ -806,31 +837,12 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
                 num_beacons = len(beacon_indices)
                 num_current_turn = len(current_turn_indices)
-
-                # 计算原始位置和目标位置
-                orig_positions = keep_indices.clone()  # 原始位置就是keep_indices
-
-                # 目标位置：System(0~system_end-1) + Beacons(system_end~system_end+num_beacons-1) + Current(system_end+num_beacons~...)
-                target_positions = torch.zeros_like(keep_indices)
-                # System部分：位置不变
-                target_positions[:system_end] = torch.arange(system_end, device=device)
-                # Beacon部分：紧接System
-                target_positions[system_end:system_end + num_beacons] = torch.arange(
-                    system_end, system_end + num_beacons, device=device
-                )
-                # Current turn部分：紧接Beacons
-                if num_current_turn > 0:
-                    target_positions[system_end + num_beacons:] = torch.arange(
-                        system_end + num_beacons, system_end + num_beacons + num_current_turn, device=device
-                    )
-
-                batch_orig_positions.append(orig_positions)
-                batch_target_positions.append(target_positions)
             else:
                 # 没有beacon，保留所有（不压缩）
                 keep_indices = torch.arange(min(seq_len, kv_seq_len), device=device)
-                batch_orig_positions.append(keep_indices.clone())
-                batch_target_positions.append(keep_indices.clone())
+                system_end = 0
+                num_beacons = 0
+                num_current_turn = len(keep_indices)
 
             batch_keep_indices.append(keep_indices)
             max_keep_len = max(max_keep_len, len(keep_indices))
@@ -838,22 +850,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
         if max_keep_len == 0:
             return past_key_values
 
-        # 2. 预计算RoPE的cos和sin（用于修正）
-        # 获取最大可能的位置
-        max_orig_pos = max(pos.max().item() if len(pos) > 0 else 0 for pos in batch_orig_positions)
-        max_target_pos = max(pos.max().item() if len(pos) > 0 else 0 for pos in batch_target_positions)
-        max_pos = max(max_orig_pos, max_target_pos) + 1
-
-        # 计算所有可能位置的cos和sin
-        position_ids_for_rope = torch.arange(max_pos, device=device).unsqueeze(0)
-        cos_all, sin_all = self.rotary_emb(
-            torch.zeros(1, max_pos, head_dim, device=device, dtype=dtype),
-            position_ids_for_rope
-        )  # [1, max_pos, head_dim]
-        cos_all = cos_all.squeeze(0)  # [max_pos, head_dim]
-        sin_all = sin_all.squeeze(0)
-
-        # 3. 准备新的Cache容器
+        # 2. 准备新的Cache容器，直接提取KV，不做RoPE修正
         compressed_cache = DynamicCache()
         num_layers = len(key_cache_list)
 
@@ -868,55 +865,20 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
             for b in range(batch_size):
                 keep_indices = batch_keep_indices[b]
-                orig_positions = batch_orig_positions[b]
-                target_positions = batch_target_positions[b]
                 keep_count = len(keep_indices)
 
                 if keep_count > 0:
-                    # 提取需要保留的KV
+                    # 直接提取需要保留的KV，不做任何位置修正
                     k_chunk = original_key[b, :, keep_indices, :]  # [num_heads, keep_count, head_dim]
                     v_chunk = original_value[b, :, keep_indices, :]
 
-                    # === RoPE 修正开关 (调试用) ===
-                    # 设置为 False 来禁用 RoPE 修正，验证是否是修正逻辑的问题
-                    ENABLE_ROPE_CORRECTION = False
-
-                    # 计算位置差
-                    pos_diff = target_positions - orig_positions  # [keep_count]
-                    needs_correction = (pos_diff != 0)
-
-                    if ENABLE_ROPE_CORRECTION and needs_correction.any():
-                        # === RoPE 修正 (2024-12 修复) ===
-                        # K已经带有原始位置的RoPE编码，需要变换到目标位置
-                        # 使用组合变换: K_new = K_old * cos(target-orig) + rotate_half(K_old) * sin(target-orig)
-
-                        # 获取原始和目标位置的cos/sin
-                        cos_orig = cos_all[orig_positions]  # [keep_count, head_dim]
-                        sin_orig = sin_all[orig_positions]
-                        cos_target = cos_all[target_positions]
-                        sin_target = sin_all[target_positions]
-
-                        # 使用角度差计算: cos(target-orig) 和 sin(target-orig)
-                        cos_diff = cos_target * cos_orig + sin_target * sin_orig  # [keep_count, head_dim]
-                        sin_diff = sin_target * cos_orig - cos_target * sin_orig
-
-                        # 扩展维度以匹配k_chunk: [num_heads, keep_count, head_dim]
-                        cos_diff = cos_diff.unsqueeze(0)  # [1, keep_count, head_dim]
-                        sin_diff = sin_diff.unsqueeze(0)
-
-                        # 应用RoPE修正
-                        k_chunk = k_chunk * cos_diff + rotate_half(k_chunk) * sin_diff
-
-                    # DEBUG：验证压缩后的结构
+                    # DEBUG：验证压缩后的结构（只打印第一层第一个batch）
                     if layer_idx == 0 and b == 0:
-                        system_end = qa_segments[b][0][0] if (qa_segments and len(qa_segments) > b and len(qa_segments[b]) > 0) else 0
-                        num_beacons = int(beacon_positions[b].sum().item())
-                        num_current = keep_count - system_end - num_beacons
-                        print(f"\033[92m[Compress] System: {system_end}, Beacons: {num_beacons}, Current: {num_current}, Total: {keep_count}\033[0m")
-                        if ENABLE_ROPE_CORRECTION:
-                            print(f"\033[92m[Compress] RoPE corrected: {needs_correction.sum().item()} positions\033[0m")
-                        else:
-                            print(f"\033[93m[Compress] RoPE correction DISABLED (debug mode)\033[0m")
+                        _system_end = qa_segments[b][0][0] if (qa_segments and len(qa_segments) > b and len(qa_segments[b]) > 0) else 0
+                        _num_beacons = int(beacon_positions[b].sum().item())
+                        _num_current = keep_count - _system_end - _num_beacons
+                        print(f"\033[92m[Compress] System: {_system_end}, Beacons: {_num_beacons}, Current: {_num_current}, Total: {keep_count}\033[0m")
+                        print(f"\033[92m[Compress] Original seq_len: {seq_len}, No RoPE correction (positions preserved)\033[0m")
 
                     # Padding处理
                     if keep_count < max_keep_len:
@@ -1224,8 +1186,10 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         """
         准备生成所需的输入，确保 enable_beacon_compression 参数正确传递。
 
-        关键修复：当 KV cache 被压缩后，position_ids 需要基于压缩后的长度计算，
-        而不是基于原始 attention_mask 的长度。
+        关键设计 (2024-12 修正):
+        - 压缩后不修正 RoPE，保持原始位置编码
+        - 新生成的 token 的 position_ids 从原始序列长度继续
+        - 这样训练和推理时的相对位置距离完全一致
         """
         # 如果有 past_key_values，说明是 decoding 阶段，只取最后一个 token
         if past_key_values is not None:
@@ -1234,24 +1198,29 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             elif input_ids.shape[1] != cache_position.shape[0]:
                 input_ids = input_ids[:, cache_position]
 
-        # === 关键修复：基于压缩后的 KV cache 长度计算 position_ids ===
-        # 检查是否有压缩后的长度信息
+        # === 关键：使用原始序列长度计算 position_ids ===
+        # 这样新 token 的位置从原始序列长度继续，保持与训练时相同的相对距离
+        original_seq_len = getattr(self.model, '_original_seq_length', None)
         compressed_len = getattr(self.model, '_compressed_seq_length', None)
 
-        if past_key_values is not None and compressed_len is not None:
-            # 生成阶段：position_ids 应该基于压缩后的 KV cache 长度
-            # 新 token 的位置 = 压缩后长度 + 已生成的 token 数
+        if past_key_values is not None and original_seq_len is not None:
+            # 生成阶段：position_ids 应该基于原始序列长度（压缩前）
+            # 计算已生成的新 token 数量
             kv_len = past_key_values.get_seq_length() if hasattr(past_key_values, 'get_seq_length') else 0
+            # 已生成的 token 数 = 当前 KV 长度 - 压缩后的初始长度
+            generated_tokens = kv_len - compressed_len if compressed_len is not None else 0
+
             batch_size = input_ids.shape[0]
             seq_len = input_ids.shape[1]
 
-            # 生成连续的 position_ids，从 kv_len 开始
+            # 新 token 的位置 = 原始序列长度 + 已生成的 token 数
+            start_pos = original_seq_len + generated_tokens
             position_ids = torch.arange(
-                kv_len, kv_len + seq_len,
+                start_pos, start_pos + seq_len,
                 dtype=torch.long, device=input_ids.device
             ).unsqueeze(0).expand(batch_size, -1)
 
-            # 同时更新 cache_position
+            # cache_position 仍然基于实际的 KV cache 位置（用于 cache 索引）
             cache_position = torch.arange(
                 kv_len, kv_len + seq_len,
                 device=input_ids.device
@@ -1314,6 +1283,10 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         """
         重写 generate 方法，确保 beacon compression 参数正确设置
         """
+        # 重置状态变量，确保每次 generate 调用都是独立的
+        self.model._original_seq_length = None
+        self.model._compressed_seq_length = None
+
         # 从 kwargs 中提取 enable_beacon_compression，如果有的话用它更新模型属性
         if 'enable_beacon_compression' in kwargs:
             self.enable_beacon_compression = kwargs.pop('enable_beacon_compression')
@@ -1383,6 +1356,8 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                 layer.self_attn.beacon_q_proj = layer.self_attn.beacon_q_proj.to(dtype=target_dtype, device=target_device)
                 layer.self_attn.beacon_k_proj = layer.self_attn.beacon_k_proj.to(dtype=target_dtype, device=target_device)
                 layer.self_attn.beacon_v_proj = layer.self_attn.beacon_v_proj.to(dtype=target_dtype, device=target_device)
+            if hasattr(layer.self_attn, 'beacon_o_proj'):
+                layer.self_attn.beacon_o_proj = layer.self_attn.beacon_o_proj.to(dtype=target_dtype, device=target_device)
             if hasattr(layer.self_attn, 'beacon_q_norm'):
                 layer.self_attn.beacon_q_norm = layer.self_attn.beacon_q_norm.to(dtype=target_dtype, device=target_device)
                 layer.self_attn.beacon_k_norm = layer.self_attn.beacon_k_norm.to(dtype=target_dtype, device=target_device)
