@@ -877,36 +877,26 @@ class Qwen3Model(Qwen3PreTrainedModel):
                     k_chunk = original_key[b, :, keep_indices, :]  # [num_heads, keep_count, head_dim]
                     v_chunk = original_value[b, :, keep_indices, :]
 
-                    # === RoPE 修正 (2024-12 修复) ===
-                    # K已经带有原始位置的RoPE编码，需要：
-                    # 1. 反转原始RoPE: K_no_rope = inverse_rope(K, orig_pos)
-                    # 2. 应用新RoPE: K_new = apply_rope(K_no_rope, target_pos)
+                    # === RoPE 修正开关 (调试用) ===
+                    # 设置为 False 来禁用 RoPE 修正，验证是否是修正逻辑的问题
+                    ENABLE_ROPE_CORRECTION = False
 
-                    # 获取原始和目标位置的cos/sin
-                    cos_orig = cos_all[orig_positions]  # [keep_count, head_dim]
-                    sin_orig = sin_all[orig_positions]
-                    cos_target = cos_all[target_positions]
-                    sin_target = sin_all[target_positions]
-
-                    # 反转原始RoPE: K_no_rope = K * cos_orig + rotate_half(K) * (-sin_orig)
-                    # 注意：原始RoPE是 K_rope = K * cos + rotate_half(K) * sin
-                    # 所以反转是 K = K_rope * cos - rotate_half(K_rope) * sin (近似，实际需要精确反转)
-                    # 精确反转: K = (K_rope * cos + rotate_half(K_rope) * sin) / (cos^2 + sin^2) = K_rope * cos + rotate_half(K_rope) * sin (因为cos^2+sin^2=1)
-                    # 但rotate_half的逆是rotate_half本身，所以：
-                    # K = K_rope * cos - rotate_half(K_rope) * sin
-
-                    # 为了正确处理，我们使用组合变换：
-                    # K_new = K_old * cos(target-orig) + rotate_half(K_old) * sin(target-orig)
-                    # 这等价于先反转再应用新位置
-
-                    # 计算位置差的cos和sin
+                    # 计算位置差
                     pos_diff = target_positions - orig_positions  # [keep_count]
-                    # 只对需要修正的位置（pos_diff != 0）进行RoPE修正
                     needs_correction = (pos_diff != 0)
 
-                    if needs_correction.any():
-                        # 使用角度差计算: cos(target)*cos(orig) + sin(target)*sin(orig) = cos(target-orig)
-                        #                sin(target)*cos(orig) - cos(target)*sin(orig) = sin(target-orig)
+                    if ENABLE_ROPE_CORRECTION and needs_correction.any():
+                        # === RoPE 修正 (2024-12 修复) ===
+                        # K已经带有原始位置的RoPE编码，需要变换到目标位置
+                        # 使用组合变换: K_new = K_old * cos(target-orig) + rotate_half(K_old) * sin(target-orig)
+
+                        # 获取原始和目标位置的cos/sin
+                        cos_orig = cos_all[orig_positions]  # [keep_count, head_dim]
+                        sin_orig = sin_all[orig_positions]
+                        cos_target = cos_all[target_positions]
+                        sin_target = sin_all[target_positions]
+
+                        # 使用角度差计算: cos(target-orig) 和 sin(target-orig)
                         cos_diff = cos_target * cos_orig + sin_target * sin_orig  # [keep_count, head_dim]
                         sin_diff = sin_target * cos_orig - cos_target * sin_orig
 
@@ -915,18 +905,18 @@ class Qwen3Model(Qwen3PreTrainedModel):
                         sin_diff = sin_diff.unsqueeze(0)
 
                         # 应用RoPE修正
-                        k_corrected = k_chunk * cos_diff + rotate_half(k_chunk) * sin_diff
-                        k_chunk = k_corrected
+                        k_chunk = k_chunk * cos_diff + rotate_half(k_chunk) * sin_diff
 
                     # DEBUG：验证压缩后的结构
                     if layer_idx == 0 and b == 0:
-                        num_system = (target_positions < (batch_orig_positions[b][0] if len(batch_orig_positions[b]) > 0 else 0)).sum().item() if qa_segments and len(qa_segments[b]) > 0 else 0
-                        # 简化：直接从qa_segments获取
                         system_end = qa_segments[b][0][0] if (qa_segments and len(qa_segments) > b and len(qa_segments[b]) > 0) else 0
-                        num_beacons = beacon_positions[b].sum().item()
+                        num_beacons = int(beacon_positions[b].sum().item())
                         num_current = keep_count - system_end - num_beacons
                         print(f"\033[92m[Compress] System: {system_end}, Beacons: {num_beacons}, Current: {num_current}, Total: {keep_count}\033[0m")
-                        print(f"\033[92m[Compress] RoPE corrected: {needs_correction.sum().item()} positions\033[0m")
+                        if ENABLE_ROPE_CORRECTION:
+                            print(f"\033[92m[Compress] RoPE corrected: {needs_correction.sum().item()} positions\033[0m")
+                        else:
+                            print(f"\033[93m[Compress] RoPE correction DISABLED (debug mode)\033[0m")
 
                     # Padding处理
                     if keep_count < max_keep_len:
