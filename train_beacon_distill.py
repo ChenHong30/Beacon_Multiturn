@@ -120,13 +120,17 @@ class DistillationTrainer(Trainer):
         attention_mask = inputs.get("attention_mask")
         labels = inputs["labels"]
 
+        # 获取原始模型（处理DDP包装）
+        unwrapped_model = model.module if hasattr(model, 'module') else model
+        inner_model = unwrapped_model.model  # Qwen3ForCausalLM.model -> Qwen3Model
+
         # ========== Step 1: Teacher Forward (无beacon) ==========
         # 禁用beacon，获取teacher的logits
         with torch.no_grad():
-            model.model._original_seq_length = None
-            model.model._compressed_seq_length = None
+            inner_model._original_seq_length = None
+            inner_model._compressed_seq_length = None
 
-            teacher_outputs = model(
+            teacher_outputs = unwrapped_model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 labels=None,  # 不计算loss
@@ -138,10 +142,10 @@ class DistillationTrainer(Trainer):
             teacher_hidden = teacher_outputs.hidden_states[-1].detach()  # 最后一层hidden
 
         # ========== Step 2: Student Forward (有beacon) ==========
-        model.model._original_seq_length = None
-        model.model._compressed_seq_length = None
+        inner_model._original_seq_length = None
+        inner_model._compressed_seq_length = None
 
-        student_outputs = model(
+        student_outputs = unwrapped_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             labels=labels,  # 会自动计算CE loss
