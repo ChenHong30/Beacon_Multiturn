@@ -520,7 +520,7 @@ def main():
         save_total_limit=args.save_total_limit,
         bf16=args.bf16,
         fp16=args.fp16,
-        evaluation_strategy="steps" if eval_dataset else "no",
+        eval_strategy="steps" if eval_dataset else "no",
         logging_dir=logging_dir,
         report_to="none",
         gradient_checkpointing=args.gradient_checkpointing,
