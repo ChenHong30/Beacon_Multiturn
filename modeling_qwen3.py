@@ -722,11 +722,21 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 # 只在历史消息（非system，且在最后一个user之前）后添加beacon
                 if i in history_messages:
                     # Insert beacon tokens (数量由 config 指定)
-                    for _ in range(self.num_beacons_per_segment):
+                    for beacon_idx in range(self.num_beacons_per_segment):
                         modified_ids.append(self.beacon_token_id)
                         beacon_pos.append(1)  # 标记这是beacon token位置
                         if labels is not None and modified_label_ids is not None:
-                            modified_label_ids.append(-100)  # beacon位置不参与loss
+                            # 最后一个beacon预测下一个token（通常是<|im_start|>）
+                            # 其他beacon位置不参与loss
+                            if beacon_idx == self.num_beacons_per_segment - 1:
+                                # 获取segment后的下一个token作为预测目标
+                                next_token_pos = end_pos + 1
+                                if next_token_pos < len(ids):
+                                    modified_label_ids.append(ids[next_token_pos])
+                                else:
+                                    modified_label_ids.append(-100)  # 没有下一个token
+                            else:
+                                modified_label_ids.append(-100)  # 非最后beacon不参与loss
 
                     # 记录 (段落在modified中的起始位置, beacon在modified中的位置)
                     # 指向这一批beacons的最后一个
