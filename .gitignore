@@ -7,3 +7,5 @@ runs
 test.py
 *.md
 activation_beacon
+Qwen2-1.5B-Instruct
+Qwen3-0.6B

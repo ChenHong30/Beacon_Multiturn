@@ -186,6 +186,12 @@ def parse_args() -> argparse.Namespace:
         default=16,
         help="Number of beacon tokens to insert per historical segment (default: 16).",
     )
+    parser.add_argument(
+        "--num-sinks",
+        type=int,
+        default=4,
+        help="Number of sink tokens to retain at the beginning of each turn (default: 4).",
+    )
     args = parser.parse_args()
 
     if args.fp16 and args.bf16:
@@ -644,6 +650,10 @@ def main() -> None:
         config.num_beacons_per_segment = args.num_beacons
         logger.info(f"Using {args.num_beacons} beacon tokens per segment")
 
+        # 设置 sink token 数量
+        config.num_sinks = args.num_sinks
+        logger.info(f"Using {args.num_sinks} sink tokens per turn")
+
         if config.model_type == "qwen2":
             model_cls = Qwen2ForCausalLM
             logger.info("Detected Qwen2 architecture. Using Qwen2ForCausalLM.")
@@ -664,6 +674,7 @@ def main() -> None:
         model = model_cls.from_pretrained(
             args.model_path,
             config=config,
+            tokenizer=tokenizer,  # 传入tokenizer用于beacon embedding初始化
             torch_dtype=torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else None),
             # 不使用 device_map，让 Trainer 管理设备分配
             device_map=None,

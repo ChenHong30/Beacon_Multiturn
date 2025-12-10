@@ -32,6 +32,8 @@ LEARNING_RATE="${LEARNING_RATE:-5e-5}"
 NUM_EPOCHS="${NUM_EPOCHS:-2}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.03}"
 SAVE_STEPS="${SAVE_STEPS:-500}"
+NUM_BEACONS="${NUM_BEACONS:-16}"
+NUM_SINKS="${NUM_SINKS:-4}"
 
 # 检测GPU数量
 if [ -z "$CUDA_VISIBLE_DEVICES" ]; then
@@ -54,6 +56,8 @@ echo "Gradient accumulation: $GRAD_ACCUM"
 echo "Learning rate: $LEARNING_RATE"
 echo "Warmup ratio: $WARMUP_RATIO"
 echo "Epochs: $NUM_EPOCHS"
+echo "Num beacons: $NUM_BEACONS"
+echo "Num sinks: $NUM_SINKS"
 echo "========================================"
 
 if [ "$N_GPUS" -gt 1 ]; then
@@ -74,6 +78,8 @@ if [ "$N_GPUS" -gt 1 ]; then
         --warmup-ratio $WARMUP_RATIO \
         --num-epochs $NUM_EPOCHS \
         --save-steps $SAVE_STEPS \
+        --num-beacons $NUM_BEACONS \
+        --num-sinks $NUM_SINKS \
         --bf16 \
         --train-beacon-only \
         --train-lm-head \
@@ -93,6 +99,8 @@ else
         --warmup-ratio $WARMUP_RATIO \
         --num-epochs $NUM_EPOCHS \
         --save-steps $SAVE_STEPS \
+        --num-beacons $NUM_BEACONS \
+        --num-sinks $NUM_SINKS \
         --bf16 \
         --train-beacon-only \
         --train-lm-head \
