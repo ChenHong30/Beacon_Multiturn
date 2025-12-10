@@ -958,292 +958,6 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
         return compressed_cache
 
-    def _forward_single_chunk(
-        self,
-        inputs_embeds: torch.Tensor,
-        attention_mask: Optional[torch.Tensor],
-        position_ids: torch.LongTensor,
-        past_key_values: Optional[Cache],
-        cache_position: torch.LongTensor,
-        beacon_positions: Optional[torch.Tensor],
-        use_cache: bool,
-        **kwargs,
-    ) -> tuple[torch.Tensor, Cache]:
-        """
-        对单个chunk执行transformer forward。
-        这是分轮次处理的基础函数。
-        """
-        # 准备attention mask
-        if not isinstance(attention_mask, dict):
-            mask_kwargs = {
-                "config": self.config,
-                "input_embeds": inputs_embeds,
-                "attention_mask": attention_mask,
-                "cache_position": cache_position,
-                "past_key_values": past_key_values,
-                "position_ids": position_ids,
-            }
-            causal_mask_mapping = {
-                "full_attention": create_causal_mask(**mask_kwargs),
-            }
-            if self.has_sliding_layers:
-                causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
-        else:
-            causal_mask_mapping = attention_mask
-
-        hidden_states = inputs_embeds
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
-
-        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
-            hidden_states = decoder_layer(
-                hidden_states,
-                attention_mask=causal_mask_mapping[decoder_layer.attention_type],
-                position_embeddings=position_embeddings,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                use_cache=use_cache,
-                cache_position=cache_position,
-                beacon_positions=beacon_positions,
-                **kwargs,
-            )
-
-        return hidden_states, past_key_values
-
-    def _forward_turn_by_turn(
-        self,
-        input_ids: torch.LongTensor,
-        attention_mask: Optional[torch.Tensor],
-        labels: Optional[torch.LongTensor],
-        use_cache: bool,
-        **kwargs,
-    ) -> tuple[torch.Tensor, Cache, torch.Tensor, Optional[torch.LongTensor], list]:
-        """
-        分轮次处理多轮对话。
-
-        处理流程：
-        1. 解析对话结构，识别每个历史轮次
-        2. 逐轮次处理：
-           - 处理历史轮次的token
-           - 在轮次末尾插入beacon token
-           - 使用KV cache累积状态
-        3. 最后处理当前轮次
-
-        Returns:
-            hidden_states: 最终的hidden states
-            past_key_values: 累积的KV cache
-            beacon_positions: beacon位置mask
-            modified_labels: 调整后的labels
-            qa_segments: 段落信息
-        """
-        batch_size, orig_seq_len = input_ids.shape
-        device = input_ids.device
-
-        # 解析多轮对话结构
-        qa_segments, modified_input_ids, beacon_positions, modified_labels = self.parse_multiturn_dialogue(
-            input_ids, labels
-        )
-
-        # 如果没有检测到多轮对话，直接返回普通forward
-        if not torch.any(beacon_positions):
-            return None, None, beacon_positions, labels, qa_segments
-
-        # 初始化KV cache
-        past_key_values = DynamicCache(config=self.config) if use_cache else None
-
-        # 收集所有隐藏状态用于最终输出
-        all_hidden_states = []
-        current_position = 0  # 在modified_input_ids中的当前位置
-
-        # 处理每个batch（目前假设batch_size=1，多batch需要更复杂的处理）
-        # TODO: 完善batch处理逻辑
-        for b in range(batch_size):
-            batch_hidden_states = []
-            batch_pos = 0  # 当前batch在modified序列中的位置
-
-            # 获取当前batch的segment信息
-            segments = qa_segments[b] if b < len(qa_segments) else []
-
-            if len(segments) == 0:
-                # 没有历史轮次，直接处理整个序列
-                ids = modified_input_ids[b:b+1]
-                embeds = self._get_embeddings_with_beacon(ids, beacon_positions[b:b+1])
-                seq_len = embeds.shape[1]
-                pos_ids = torch.arange(0, seq_len, device=device).unsqueeze(0)
-                cache_pos = torch.arange(0, seq_len, device=device)
-
-                hidden, past_key_values = self._forward_single_chunk(
-                    inputs_embeds=embeds,
-                    attention_mask=None,
-                    position_ids=pos_ids,
-                    past_key_values=past_key_values,
-                    cache_position=cache_pos,
-                    beacon_positions=beacon_positions[b:b+1],
-                    use_cache=use_cache,
-                    **kwargs,
-                )
-                batch_hidden_states.append(hidden)
-            else:
-                # 有历史轮次，分段处理
-                # 首先处理System部分（如果有）
-                first_segment_start = segments[0][0]
-                if first_segment_start > 0:
-                    # 存在System部分
-                    system_ids = modified_input_ids[b:b+1, :first_segment_start]
-                    system_embeds = self.embed_tokens(system_ids)
-                    system_len = system_embeds.shape[1]
-                    pos_ids = torch.arange(0, system_len, device=device).unsqueeze(0)
-                    cache_pos = torch.arange(0, system_len, device=device)
-
-                    hidden, past_key_values = self._forward_single_chunk(
-                        inputs_embeds=system_embeds,
-                        attention_mask=None,
-                        position_ids=pos_ids,
-                        past_key_values=past_key_values,
-                        cache_position=cache_pos,
-                        beacon_positions=None,
-                        use_cache=use_cache,
-                        **kwargs,
-                    )
-                    batch_hidden_states.append(hidden)
-                    batch_pos = first_segment_start
-
-                # 逐轮次处理历史段落
-                for seg_idx, (seg_start, seg_end) in enumerate(segments):
-                    # seg_start: 段落body开始位置
-                    # seg_end: 最后一个beacon的位置
-                    # 第一个beacon位置: seg_end - (num_beacons_per_segment - 1)
-                    first_beacon_pos = seg_end - (self.num_beacons_per_segment - 1)
-
-                    # 1. 处理段落body（不含beacon）
-                    body_ids = modified_input_ids[b:b+1, seg_start:first_beacon_pos]
-                    body_embeds = self.embed_tokens(body_ids)
-                    body_len = body_embeds.shape[1]
-
-                    if body_len > 0:
-                        kv_len = past_key_values.get_seq_length() if past_key_values else 0
-                        pos_ids = torch.arange(kv_len, kv_len + body_len, device=device).unsqueeze(0)
-                        cache_pos = torch.arange(kv_len, kv_len + body_len, device=device)
-
-                        hidden, past_key_values = self._forward_single_chunk(
-                            inputs_embeds=body_embeds,
-                            attention_mask=None,
-                            position_ids=pos_ids,
-                            past_key_values=past_key_values,
-                            cache_position=cache_pos,
-                            beacon_positions=None,
-                            use_cache=use_cache,
-                            **kwargs,
-                        )
-                        batch_hidden_states.append(hidden)
-
-                    # 2. 处理beacon tokens
-                    beacon_ids = modified_input_ids[b:b+1, first_beacon_pos:seg_end+1]
-                    # 获取beacon embeddings
-                    beacon_embeds = torch.zeros(
-                        (1, self.num_beacons_per_segment, self.config.hidden_size),
-                        device=device, dtype=self.embed_tokens.weight.dtype
-                    )
-                    for i in range(self.num_beacons_per_segment):
-                        beacon_embeds[0, i] = self.beacon_embedding + self.beacon_position_embedding[i]
-
-                    kv_len = past_key_values.get_seq_length() if past_key_values else 0
-                    beacon_len = beacon_embeds.shape[1]
-                    pos_ids = torch.arange(kv_len, kv_len + beacon_len, device=device).unsqueeze(0)
-                    cache_pos = torch.arange(kv_len, kv_len + beacon_len, device=device)
-
-                    # beacon位置mask
-                    beacon_pos_mask = torch.ones((1, beacon_len), dtype=torch.bool, device=device)
-
-                    hidden, past_key_values = self._forward_single_chunk(
-                        inputs_embeds=beacon_embeds,
-                        attention_mask=None,
-                        position_ids=pos_ids,
-                        past_key_values=past_key_values,
-                        cache_position=cache_pos,
-                        beacon_positions=beacon_pos_mask,
-                        use_cache=use_cache,
-                        **kwargs,
-                    )
-                    batch_hidden_states.append(hidden)
-
-                    batch_pos = seg_end + 1
-
-                # 处理当前轮次（最后一个segment之后的所有token）
-                if batch_pos < modified_input_ids.shape[1]:
-                    current_turn_ids = modified_input_ids[b:b+1, batch_pos:]
-                    # 过滤掉padding
-                    pad_token_id = self.config.pad_token_id if self.config.pad_token_id is not None else 0
-                    valid_mask = current_turn_ids[0] != pad_token_id
-                    if valid_mask.any():
-                        valid_len = valid_mask.sum().item()
-                        current_turn_ids = current_turn_ids[:, :valid_len]
-                        current_turn_embeds = self.embed_tokens(current_turn_ids)
-                        turn_len = current_turn_embeds.shape[1]
-
-                        kv_len = past_key_values.get_seq_length() if past_key_values else 0
-                        pos_ids = torch.arange(kv_len, kv_len + turn_len, device=device).unsqueeze(0)
-                        cache_pos = torch.arange(kv_len, kv_len + turn_len, device=device)
-
-                        hidden, past_key_values = self._forward_single_chunk(
-                            inputs_embeds=current_turn_embeds,
-                            attention_mask=None,
-                            position_ids=pos_ids,
-                            past_key_values=past_key_values,
-                            cache_position=cache_pos,
-                            beacon_positions=None,
-                            use_cache=use_cache,
-                            **kwargs,
-                        )
-                        batch_hidden_states.append(hidden)
-
-            # 合并所有hidden states
-            if len(batch_hidden_states) > 0:
-                all_hidden_states.append(torch.cat(batch_hidden_states, dim=1))
-
-        # 合并batch
-        if len(all_hidden_states) > 0:
-            # 需要padding到相同长度
-            max_len = max(h.shape[1] for h in all_hidden_states)
-            padded_hidden_states = []
-            for h in all_hidden_states:
-                if h.shape[1] < max_len:
-                    pad = torch.zeros(
-                        (h.shape[0], max_len - h.shape[1], h.shape[2]),
-                        device=device, dtype=h.dtype
-                    )
-                    h = torch.cat([h, pad], dim=1)
-                padded_hidden_states.append(h)
-            final_hidden_states = torch.cat(padded_hidden_states, dim=0)
-        else:
-            final_hidden_states = None
-
-        return final_hidden_states, past_key_values, beacon_positions, modified_labels, qa_segments
-
-    def _get_embeddings_with_beacon(
-        self,
-        input_ids: torch.Tensor,
-        beacon_positions: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        获取input_ids的embeddings，对beacon token使用特殊的embedding。
-        """
-        # 将beacon_token_id临时替换为0，避免索引越界
-        safe_input_ids = input_ids.clone()
-        beacon_mask = (input_ids == self.beacon_token_id)
-        safe_input_ids[beacon_mask] = 0
-        inputs_embeds = self.embed_tokens(safe_input_ids)
-
-        # 为beacon位置设置正确的embedding
-        batch_size, seq_len = input_ids.shape
-        for b in range(batch_size):
-            beacon_indices = torch.nonzero(beacon_mask[b], as_tuple=False).squeeze(-1)
-            if beacon_indices.numel() > 0:
-                for i, idx in enumerate(beacon_indices.tolist()):
-                    pos_in_segment = i % self.num_beacons_per_segment
-                    inputs_embeds[b, idx] = self.beacon_embedding + self.beacon_position_embedding[pos_in_segment]
-
-        return inputs_embeds
-
     @check_model_inputs()
     @auto_docstring
     def forward(
@@ -1259,7 +973,6 @@ class Qwen3Model(Qwen3PreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         enable_beacon_compression: Optional[bool] = True,
-        turn_by_turn: Optional[bool] = True,  # 新参数：是否使用分轮次处理
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithPast:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -1277,47 +990,17 @@ class Qwen3Model(Qwen3PreTrainedModel):
             )
             use_cache = False
 
-        # 检查是否是prefill阶段
-        is_prefill = (past_key_values is None or
-                      (hasattr(past_key_values, 'get_seq_length') and past_key_values.get_seq_length() == 0))
-
-        # === 分轮次处理逻辑 ===
-        if (input_ids is not None and enable_beacon_compression and is_prefill and turn_by_turn):
-            # 使用分轮次处理
-            hidden_states, past_key_values, beacon_positions, modified_labels, qa_segments = self._forward_turn_by_turn(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                labels=labels,
-                use_cache=use_cache,
-                **kwargs,
-            )
-
-            if hidden_states is not None:
-                # 分轮次处理成功
-                hidden_states = self.norm(hidden_states)
-
-                # 压缩KV cache
-                if (use_cache and enable_beacon_compression and beacon_positions is not None and
-                    torch.any(beacon_positions) and past_key_values is not None and past_key_values.get_seq_length() > 0):
-                    past_key_values = self.compress_kv_cache(past_key_values, beacon_positions, qa_segments)
-
-                outputs = BaseModelOutputWithPast(
-                    last_hidden_state=hidden_states,
-                    past_key_values=past_key_values if use_cache else None,
-                )
-                outputs.beacon_positions = beacon_positions
-                if modified_labels is not None:
-                    outputs.adjusted_labels = modified_labels
-
-                return outputs
-
-        # === 原始处理逻辑（作为fallback或生成阶段使用）===
+        # 多轮对话解析和beacon token处理
         beacon_positions = None
         qa_segments = None
         modified_labels = None
 
-        # 只在预填充阶段进行beacon压缩（非分轮次模式）
-        if (input_ids is not None and enable_beacon_compression and is_prefill and not turn_by_turn):
+        # 检查是否是prefill阶段：past_key_values为None 或者 长度为0
+        is_prefill = (past_key_values is None or
+                      (hasattr(past_key_values, 'get_seq_length') and past_key_values.get_seq_length() == 0))
+
+        # 只在预填充阶段进行beacon压缩
+        if (input_ids is not None and enable_beacon_compression and is_prefill):
             # 解析多轮对话并添加beacon token
             qa_segments, modified_input_ids, beacon_positions, modified_labels = self.parse_multiturn_dialogue(
                 input_ids, labels
@@ -1331,8 +1014,26 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
         if inputs_embeds is None:
             # 处理 beacon token 的 embedding
+            # beacon_token_id 超出词表范围，需要特殊处理
             if beacon_positions is not None and torch.any(beacon_positions):
-                inputs_embeds = self._get_embeddings_with_beacon(input_ids, beacon_positions)
+                # 将 beacon_token_id 临时替换为 0，避免索引越界
+                safe_input_ids = input_ids.clone()
+                beacon_mask = (input_ids == self.beacon_token_id)
+                safe_input_ids[beacon_mask] = 0
+                inputs_embeds = self.embed_tokens(safe_input_ids)
+
+                # === Beacons 增强：为每个 beacon 添加独特的 position embedding ===
+                # beacon_embedding 是共享的基础 embedding
+                # beacon_position_embedding 根据 beacon 在 segment 内的位置添加
+                batch_size, seq_len = input_ids.shape
+                for b in range(batch_size):
+                    beacon_indices = torch.nonzero(beacon_mask[b], as_tuple=False).squeeze(-1)
+                    if beacon_indices.numel() > 0:
+                        # 每 num_beacons_per_segment 个 beacons 为一组（对应一个 segment）
+                        for i, idx in enumerate(beacon_indices.tolist()):
+                            pos_in_segment = i % self.num_beacons_per_segment
+                            # 基础 embedding + 位置 embedding
+                            inputs_embeds[b, idx] = self.beacon_embedding + self.beacon_position_embedding[pos_in_segment]
             else:
                 inputs_embeds = self.embed_tokens(input_ids)
 
@@ -1350,7 +1051,9 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
         # 如果添加了beacon token，需要调整position_ids和cache_position以匹配新的序列长度
         if beacon_positions is not None and torch.any(beacon_positions):
+            # 确保position_ids和cache_position的长度与inputs_embeds匹配
             if position_ids.shape[1] != inputs_embeds.shape[1]:
+                # 重新计算position_ids和cache_position以匹配当前序列长度
                 past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
                 cache_position = torch.arange(
                     past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1],
@@ -1358,8 +1061,9 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 )
                 position_ids = cache_position.unsqueeze(0)
 
-        # 准备attention mask
+        # It may already have been prepared by e.g. `generate`
         if not isinstance(causal_mask_mapping := attention_mask, dict):
+            # Prepare mask arguments
             mask_kwargs = {
                 "config": self.config,
                 "input_embeds": inputs_embeds,
@@ -1368,20 +1072,26 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 "past_key_values": past_key_values,
                 "position_ids": position_ids,
             }
+            # Create the masks
             causal_mask_mapping = {
                 "full_attention": create_causal_mask(**mask_kwargs),
             }
+            # The sliding window alternating layers are not always activated depending on the config
             if self.has_sliding_layers:
                 causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
 
         # === Beacon Mask Logic (防止训练时"作弊") ===
+        # 强制后续token无法看到历史段落的原始文本，只能看到beacon
         if qa_segments is not None and "full_attention" in causal_mask_mapping:
             current_mask = causal_mask_mapping["full_attention"]
             seq_len = inputs_embeds.shape[1]
             dtype = inputs_embeds.dtype
             min_val = torch.finfo(dtype).min
 
+            # 如果current_mask为None (说明使用了隐式mask，例如FlashAttn)，我们需要显式创建一个mask来修改
             if current_mask is None:
+                # 创建标准Causal Mask: 上三角为-inf，下三角为0
+                # [1, 1, seq_len, seq_len]
                 current_mask = torch.zeros((1, 1, seq_len, seq_len), device=inputs_embeds.device, dtype=dtype)
                 upper_mask = torch.triu(torch.full_like(current_mask, min_val), diagonal=1)
                 current_mask = current_mask + upper_mask
@@ -1389,24 +1099,36 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
             for b, segments in enumerate(qa_segments):
                 for (start_i, end_i) in segments:
-                    first_beacon = end_i - (self.num_beacons_per_segment - 1)
+                    # start_i: 段落开始
+                    # end_i: 最后一个 beacon 的位置
+                    # 第一个 beacon 的位置: end_i - (num_beacons_per_segment - 1)
+                    # Body 范围: [start_i, first_beacon) (不包含 beacons)
 
+                    first_beacon = end_i - (self.num_beacons_per_segment - 1)  # 第一个 beacon 的位置
+
+                    # 只有当Body非空时才需要遮蔽
                     if start_i < first_beacon:
+                        # 1. 后续 tokens 看不到历史 body（只能看到 beacons）
                         if end_i + 1 < seq_len:
                             current_mask[b, 0, end_i + 1:, start_i : first_beacon] = min_val
 
+                            # 同步更新sliding window mask (如果存在)
                             if "sliding_attention" in causal_mask_mapping and causal_mask_mapping["sliding_attention"] is not None:
                                 causal_mask_mapping["sliding_attention"][b, 0, end_i + 1:, start_i : first_beacon] = min_val
 
-                        # 让同一segment内的beacons能双向attend
+                        # 2. === 关键修复：让同一 segment 内的 beacons 能双向 attend ===
+                        # 在 causal mask 中，后面的 beacon 已经能看到前面的 beacon
+                        # 我们需要让前面的 beacon 也能看到后面的 beacon（打破 causal 约束）
+                        # 这样所有 beacons 都能获得完整信息，协作压缩
                         for i in range(self.num_beacons_per_segment):
                             beacon_i = first_beacon + i
                             if beacon_i >= seq_len:
                                 break
-                            for j in range(i + 1, self.num_beacons_per_segment):
+                            for j in range(i + 1, self.num_beacons_per_segment):  # 让 beacon_i 能看到后面的 beacon_j
                                 beacon_j = first_beacon + j
                                 if beacon_j >= seq_len:
                                     break
+                                # 允许 beacon_i attend 到 beacon_j（移除 causal mask）
                                 current_mask[b, 0, beacon_i, beacon_j] = 0.0
 
                                 if "sliding_attention" in causal_mask_mapping and causal_mask_mapping["sliding_attention"] is not None:
@@ -1430,7 +1152,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
         hidden_states = self.norm(hidden_states)
 
-        # 维护KV cache压缩
+        # 维护KV cache压缩（只保留beacon token的KV）
         if (use_cache and enable_beacon_compression and beacon_positions is not None and
             torch.any(beacon_positions) and past_key_values is not None and past_key_values.get_seq_length() > 0):
             past_key_values = self.compress_kv_cache(past_key_values, beacon_positions, qa_segments)
@@ -1695,7 +1417,6 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         enable_beacon_compression: Optional[bool] = True,
-        turn_by_turn: Optional[bool] = True,  # 新参数：是否使用分轮次处理
         **kwargs: Unpack[TransformersKwargs],
     ) -> CausalLMOutputWithPast:
         r"""
@@ -1752,7 +1473,6 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             output_hidden_states=output_hidden_states,
             cache_position=cache_position,
             enable_beacon_compression=enable_beacon_compression,
-            turn_by_turn=turn_by_turn,
             **kwargs,
         )
 
