@@ -192,6 +192,12 @@ def parse_args() -> argparse.Namespace:
         default=4,
         help="Number of sink tokens to retain at the beginning of each turn (default: 4).",
     )
+    parser.add_argument(
+        "--resume-from-checkpoint",
+        type=str,
+        default=None,
+        help="Path to a specific checkpoint folder to resume training from (e.g., ./output/checkpoint-500).",
+    )
     args = parser.parse_args()
 
     if args.fp16 and args.bf16:
@@ -687,6 +693,14 @@ def main() -> None:
         if args.gradient_checkpointing:
             model.gradient_checkpointing_enable()
 
+        # 修复可能没有beacon插入时梯度None的bug
+        if hasattr(model, "enable_input_require_grads"):
+                model.enable_input_require_grads()
+        else:
+            def make_inputs_require_grad(module, input, output):
+                output.requires_grad_(True)
+            model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
+
         if args.train_beacon_only:
             freeze_non_beacon_parameters(model, train_lm_head=args.train_lm_head)
         else:
@@ -732,7 +746,7 @@ def main() -> None:
             "seed": args.seed,
             "prediction_loss_only": False,
             # 多GPU相关配置
-            "dataloader_num_workers": 4 if is_distributed else 0,
+            "dataloader_num_workers": n_gpus if is_distributed else 0,
             "ddp_find_unused_parameters": False,  # beacon参数可能未被使用，但我们显式冻结了
         }
         if eval_dataset is not None:
@@ -762,8 +776,11 @@ def main() -> None:
             compute_metrics=compute_metrics if eval_dataset is not None else None,
             callbacks=[metrics_callback],
         )
-
-        trainer.train()
+        if args.resume_from_checkpoint is not None:
+            logger.info("Resuming training from checkpoint: %s", args.resume_from_checkpoint)
+            trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
+        else:
+            trainer.train()
 
         trainer.save_model(args.output_dir)
         tokenizer.save_pretrained(args.output_dir)

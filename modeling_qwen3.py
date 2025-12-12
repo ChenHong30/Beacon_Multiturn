@@ -403,6 +403,20 @@ class Qwen3Attention(nn.Module):
             key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
             value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
+            # Fix for DDP unused parameters issue:
+            # Even if no beacons are present, we must ensure beacon parameters participate in the graph
+            # to avoid "unused parameter" errors in DDP.
+            if self.training and self.beacon_q_proj.weight.requires_grad:
+                dummy_beacon = (
+                    self.beacon_q_proj.weight.sum() + 
+                    self.beacon_k_proj.weight.sum() + 
+                    self.beacon_v_proj.weight.sum() + 
+                    self.beacon_o_proj.weight.sum() + 
+                    self.beacon_q_norm.weight.sum() + 
+                    self.beacon_k_norm.weight.sum()
+                ) * 0.0
+                query_states = query_states + dummy_beacon
+
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
@@ -664,13 +678,18 @@ class Qwen3Model(Qwen3PreTrainedModel):
             # 分析对话结构，识别角色
             message_roles = []
             for start_pos, end_pos in pairs:
-                segment_tokens = ids[start_pos:end_pos + 1]
-                if self.system_id in segment_tokens:
-                    message_roles.append("system")
-                elif self.user_id in segment_tokens:
-                    message_roles.append("user")
-                elif self.assistant_id in segment_tokens:
-                    message_roles.append("assistant")
+                # 严格检查 <|im_start|> 紧接着的下一个token
+                # 之前的逻辑: if self.system_id in segment_tokens: ... 会因为内容中包含system/user/assistant token而误判
+                if start_pos + 1 < len(ids):
+                    role_id = ids[start_pos + 1]
+                    if role_id == self.system_id:
+                        message_roles.append("system")
+                    elif role_id == self.user_id:
+                        message_roles.append("user")
+                    elif role_id == self.assistant_id:
+                        message_roles.append("assistant")
+                    else:
+                        message_roles.append("unknown")
                 else:
                     message_roles.append("unknown")
 
@@ -1032,6 +1051,8 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 safe_input_ids[beacon_mask] = 0
                 inputs_embeds = self.embed_tokens(safe_input_ids)
 
+                inputs_embeds = inputs_embeds.clone()
+
                 # === Beacons 增强：为每个 beacon 添加独特的 position embedding ===
                 # beacon_embedding 是共享的基础 embedding
                 # beacon_position_embedding 根据 beacon 在 segment 内的位置添加
@@ -1046,6 +1067,14 @@ class Qwen3Model(Qwen3PreTrainedModel):
                             inputs_embeds[b, idx] = self.beacon_embedding + self.beacon_position_embedding[pos_in_segment]
             else:
                 inputs_embeds = self.embed_tokens(input_ids)
+                
+                # Fix for DDP unused parameters issue (Beacon Embeddings):
+                if self.training and self.beacon_embedding.requires_grad:
+                     dummy_beacon_emb = (
+                         self.beacon_embedding.sum() + 
+                         self.beacon_position_embedding.sum()
+                     ) * 0.0
+                     inputs_embeds = inputs_embeds + dummy_beacon_emb
 
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache(config=self.config)
