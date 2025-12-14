@@ -1040,6 +1040,15 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 input_ids = modified_input_ids
                 if modified_labels is not None:
                     labels = modified_labels
+                # 关键修复：input_ids 插入了 beacon token 后长度发生变化，
+                # attention_mask 也必须同步扩展/重建，否则后半段 token 会被误当作 padding 而被 mask 掉，
+                # 进而出现“总在回答上一轮 / 当前 query 不生效”等错位现象。
+                if attention_mask is not None and isinstance(attention_mask, torch.Tensor) and attention_mask.ndim == 2:
+                    pad_id = self.config.pad_token_id
+                    if pad_id is None:
+                        attention_mask = torch.ones_like(input_ids, dtype=torch.long, device=input_ids.device)
+                    else:
+                        attention_mask = (input_ids != pad_id).to(dtype=torch.long)
 
         if inputs_embeds is None:
             # 处理 beacon token 的 embedding
