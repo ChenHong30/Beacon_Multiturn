@@ -674,7 +674,7 @@ def main() -> None:
             args.model_path,
             config=config,
             tokenizer=tokenizer,  # 传入tokenizer用于beacon embedding初始化
-            torch_dtype=torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else None),
+            dtype=torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else None),
             # 不使用 device_map，让 Trainer 管理设备分配
             device_map=None,
             # 关键：强制使用 eager attention，确保自定义 beacon mask 正确应用
@@ -707,8 +707,6 @@ def main() -> None:
 
         data_collator = BeaconDataCollator(tokenizer=tokenizer)
 
-        evaluation_strategy = "steps" if eval_dataset is not None else "no"
-
         # 检测是否在分布式环境中运行
         is_distributed = n_gpus > 1
 
@@ -726,7 +724,6 @@ def main() -> None:
             "save_total_limit": args.save_total_limit,
             "bf16": args.bf16,
             "fp16": args.fp16,
-            "evaluation_strategy": evaluation_strategy,
             "logging_strategy": "steps",
             "logging_dir": logging_dir,
             "report_to": "none",

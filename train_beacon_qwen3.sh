@@ -11,7 +11,8 @@
 #   指定GPU训练:
 #     CUDA_VISIBLE_DEVICES=0,1 ./run_train.sh
 
-export CUDA_VISIBLE_DEVICES=0,1,2
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 set -e
@@ -23,7 +24,7 @@ cd "$SCRIPT_DIR"
 # 默认参数 (使用你的配置)
 MODEL_PATH="${MODEL_PATH:-/home/hkustgz/model_weights/Qwen3-8B}"
 DATA_PATHS="${DATA_PATHS:-ultrachat-200k-le4turns1.jsonl}"
-OUTPUT_DIR="${OUTPUT_DIR:-./runs/beacon-ft-v2-qwen3}"
+OUTPUT_DIR="${OUTPUT_DIR:-/data/hkustgz/model_weight/16_beacon_4_sink}"
 PROCESSED_CACHE_DIR="${PROCESSED_CACHE_DIR:-./runs/dataset_cache}"
 MAX_LENGTH="${MAX_LENGTH:-4096}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
@@ -32,7 +33,7 @@ LEARNING_RATE="${LEARNING_RATE:-5e-5}"
 NUM_EPOCHS="${NUM_EPOCHS:-2}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.03}"
 SAVE_STEPS="${SAVE_STEPS:-500}"
-NUM_BEACONS="${NUM_BEACONS:-4}"
+NUM_BEACONS="${NUM_BEACONS:-16}"
 NUM_SINKS="${NUM_SINKS:-4}"
 
 # 检测GPU数量
