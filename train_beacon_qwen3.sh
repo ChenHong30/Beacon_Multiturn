@@ -1,42 +1,33 @@
 #!/bin/bash
-# Beacon Multi-turn Training Script with Multi-GPU Support
-#
-# Usage:
-#   单卡训练:
-#     ./run_train.sh
-#
-#   多卡训练 (自动使用所有可见GPU):
-#     CUDA_VISIBLE_DEVICES=0,1,2,3 ./run_train.sh
-#
-#   指定GPU训练:
-#     CUDA_VISIBLE_DEVICES=0,1 ./run_train.sh
 
+# Set environment variables
 export CUDA_VISIBLE_DEVICES=0,1,2,3
 export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
+# Exit immediately if a command exits with a non-zero status
 set -e
 
-# 获取脚本所在目录
+# Obtain the directory of the script and change to it
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# 默认参数 (使用你的配置)
-MODEL_PATH="${MODEL_PATH:-/home/hkustgz/model_weights/Qwen3-8B}"
-DATA_PATHS="${DATA_PATHS:-ultrachat-200k-le4turns1.jsonl}"
-OUTPUT_DIR="${OUTPUT_DIR:-/data/hkustgz/model_weight/16_beacon_4_sink}"
-PROCESSED_CACHE_DIR="${PROCESSED_CACHE_DIR:-./runs/dataset_cache}"
-MAX_LENGTH="${MAX_LENGTH:-4096}"
-BATCH_SIZE="${BATCH_SIZE:-1}"
-GRAD_ACCUM="${GRAD_ACCUM:-2}"
-LEARNING_RATE="${LEARNING_RATE:-5e-5}"
-NUM_EPOCHS="${NUM_EPOCHS:-2}"
-WARMUP_RATIO="${WARMUP_RATIO:-0.03}"
-SAVE_STEPS="${SAVE_STEPS:-500}"
-NUM_BEACONS="${NUM_BEACONS:-16}"
-NUM_SINKS="${NUM_SINKS:-4}"
+# Parameters
+MODEL_PATH="/home/hkustgz/model_weights/Qwen3-8B" # The path of base model, it can be a local path or a model name from Hugging Face
+DATA_PATHS="ultrachat-200k-le4turns1.jsonl" # The path(s) of training data, can be multiple paths separated by space
+OUTPUT_DIR="/data/hkustgz/model_weight/16_beacon_4_sink" # The output directory to save trained model and logs
+PROCESSED_CACHE_DIR="./runs/dataset_cache" # The directory to cache processed datasets
+MAX_LENGTH="4096" # The maximum sequence length
+BATCH_SIZE="1" # The batch size per device
+GRAD_ACCUM="2" # The number of gradient accumulation steps
+LEARNING_RATE="5e-5" # The learning rate
+NUM_EPOCHS="2" # The number of training epochs
+WARMUP_RATIO="0.03" # The warmup ratio
+SAVE_STEPS="500" # The number of steps between saving model checkpoints
+NUM_BEACONS="16" # The number of beacons per conversation turn
+NUM_SINKS="4" # The number of sinks per conversation turn
 
-# 检测GPU数量
+# Determine the number of GPUs available
 if [ -z "$CUDA_VISIBLE_DEVICES" ]; then
     N_GPUS=$(nvidia-smi -L | wc -l)
 else
@@ -63,7 +54,6 @@ echo "========================================"
 
 if [ "$N_GPUS" -gt 1 ]; then
     echo "Starting distributed training with $N_GPUS GPUs..."
-    # 使用 torchrun 进行分布式训练 (推荐，比 python -m torch.distributed.launch 更新)
     torchrun \
         --nproc_per_node=$N_GPUS \
         --master_port=29500 \

@@ -960,8 +960,8 @@ class Qwen3Model(Qwen3PreTrainedModel):
                         _num_beacons = int(beacon_positions[b].sum().item())
                         _num_segments = len(qa_segments[b]) if qa_segments and len(qa_segments) > b else 0
                         _num_sinks_total = _num_segments * self.num_sinks
-                        print(f"\033[92m[Compress] System: {_system_end}, Sinks: {_num_sinks_total}, Beacons: {_num_beacons}, Total: {keep_count}\033[0m")
-                        print(f"\033[92m[Compress] Original seq_len: {seq_len}, No RoPE correction (positions preserved)\033[0m")
+                        # print(f"\033[92m[Compress] System: {_system_end}, Sinks: {_num_sinks_total}, Beacons: {_num_beacons}, Total: {keep_count}\033[0m")
+                        # print(f"\033[92m[Compress] Original seq_len: {seq_len}, No RoPE correction (positions preserved)\033[0m")
 
                     # Padding处理
                     if keep_count < max_keep_len:

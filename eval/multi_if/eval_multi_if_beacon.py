@@ -2,9 +2,11 @@ import sys
 import os
 import re
 import json
+import multiprocessing as mp
+import time
 from datetime import datetime
 from collections import defaultdict
-from typing import Any, List, Dict, Optional
+from typing import Any, List, Dict, Optional, Tuple
 
 # ------------------------------------------------------------
 # Make project root importable
@@ -37,6 +39,8 @@ def load_beacon_model(model_path: str, device_id: int = 0, num_sinks: int = 1):
     print(f"num_sinks = {config.num_sinks}")
     print(f"num_beacons_per_segment = {config.num_beacons_per_segment}")
 
+    if torch.cuda.is_available():
+        torch.cuda.set_device(device_id)
     device = f"cuda:{device_id}" if torch.cuda.is_available() else "cpu"
 
     model = BeaconQwen3ForCausalLM.from_pretrained(
@@ -59,6 +63,191 @@ def write_json_atomic(path: str, data: Dict[str, Any]) -> None:
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
     os.replace(tmp_path, path)
+
+
+def _parse_cuda_ids(cuda_id: Any, cuda_ids: Optional[Any]) -> List[int]:
+    """
+    Parse GPU ids from either `cuda_ids` (preferred) or `cuda_id` (backward compatible).
+
+    Notes:
+      - `python-fire` may parse values like "0,1,2,3" into a tuple (0, 1, 2, 3).
+      - We accept list/tuple/int/str for both params.
+    """
+    source = cuda_ids if cuda_ids is not None else cuda_id
+    if source is None:
+        return [0]
+
+    if isinstance(source, (list, tuple)):
+        ids = [int(x) for x in source]
+    elif isinstance(source, str):
+        s = source.strip()
+        if not s:
+            ids = [0]
+        else:
+            # accept e.g. "0,1,2,3" or "[0,1,2,3]"
+            if s.startswith("[") and s.endswith("]"):
+                try:
+                    parsed = json.loads(s)
+                    if isinstance(parsed, list):
+                        ids = [int(x) for x in parsed]
+                    else:
+                        ids = [0]
+                except Exception:
+                    ids = [int(x) for x in re.split(r"[,\s]+", s) if x]
+            else:
+                ids = [int(x) for x in re.split(r"[,\s]+", s) if x]
+    else:
+        ids = [int(source)]
+
+    # de-dup but keep order
+    ids = list(dict.fromkeys(ids))
+    return ids
+
+
+def _validate_cuda_ids(cuda_ids: List[int]) -> None:
+    if not torch.cuda.is_available():
+        if cuda_ids and cuda_ids != [0]:
+            print(f"[WARN] CUDA not available; falling back to CPU (cuda_ids={cuda_ids}).")
+        return
+
+    device_count = torch.cuda.device_count()
+    for cid in cuda_ids:
+        if cid < 0 or cid >= device_count:
+            raise ValueError(
+                f"Invalid cuda_id={cid}; torch.cuda.device_count()={device_count}."
+            )
+
+
+def _get_english_indices_by_split(ds) -> Tuple[List[str], Dict[str, List[int]]]:
+    split_names = list(ds.keys())
+    english_indices_by_split: Dict[str, List[int]] = {}
+    for split in split_names:
+        langs = ds[split]["language"]
+        english_indices_by_split[split] = [
+            i for i, lang in enumerate(langs)
+            if str(lang or "").lower() == "english"
+        ]
+    return split_names, english_indices_by_split
+
+
+def _worker_output_path(log_dir: str, timestamp: str, run_tag: str, worker_id: int) -> str:
+    return os.path.join(
+        log_dir, f"multi_if_beacon_{timestamp}_{run_tag}.worker{worker_id}.json"
+    )
+
+
+def _run_worker(
+    *,
+    worker_id: int,
+    num_workers: int,
+    cuda_id: int,
+    model_path: str,
+    num_sinks: int,
+    log_dir: str,
+    timestamp: str,
+    run_tag: str,
+    split_names: List[str],
+    english_indices_by_split: Dict[str, List[int]],
+    verbose: bool,
+    flush_every: int,
+    progress_counter: Optional[Any],
+) -> None:
+    worker_out = _worker_output_path(log_dir, timestamp, run_tag, worker_id)
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_path,
+        trust_remote_code=True,
+        fix_mistral_regex=True,
+    )
+    model, device = load_beacon_model(
+        model_path,
+        device_id=cuda_id,
+        num_sinks=num_sinks,
+    )
+
+    ds = load_dataset("facebook/Multi-IF")
+
+    all_eval_results: List[Dict[str, Any]] = []
+    errors: List[Dict[str, Any]] = []
+
+    def flush() -> None:
+        output = {
+            "meta": {
+                "timestamp": timestamp,
+                "model_path": model_path,
+                "cuda_id": cuda_id,
+                "worker_id": worker_id,
+                "num_workers": num_workers,
+                "run_tag": run_tag,
+                "num_sinks": num_sinks,
+                "splits": split_names,
+                "attempted": len(all_eval_results) + len(errors),
+                "succeeded": len(all_eval_results),
+                "failed": len(errors),
+            },
+            "results": all_eval_results,
+            "errors": errors,
+        }
+        try:
+            write_json_atomic(worker_out, output)
+        except Exception as e:
+            print(f"[WARN] Failed to write {worker_out}: {e}")
+
+    flush()
+    try:
+        global_english_idx = 0
+        processed = 0
+        for split in split_names:
+            orig_indices = english_indices_by_split.get(split) or []
+            for en_idx, orig_idx in enumerate(orig_indices):
+                if global_english_idx % num_workers != worker_id:
+                    global_english_idx += 1
+                    continue
+
+                sample = ds[split][orig_idx]
+                try:
+                    generated_responses = run_multi_if_sample(
+                        sample=sample,
+                        model=model,
+                        tokenizer=tokenizer,
+                        device=device,
+                        verbose=verbose,
+                    )
+                    eval_result = eval_multi_if_sample(
+                        sample=sample,
+                        generated_responses=generated_responses,
+                    )
+                    eval_result["split"] = split
+                    eval_result["index"] = en_idx
+                    eval_result["orig_index"] = orig_idx
+                    eval_result["global_index"] = global_english_idx
+                    all_eval_results.append(eval_result)
+                except Exception as e:
+                    errors.append(
+                        {
+                            "split": split,
+                            "index": en_idx,
+                            "orig_index": orig_idx,
+                            "global_index": global_english_idx,
+                            "key": sample.get("key"),
+                            "error": repr(e),
+                        }
+                    )
+                finally:
+                    global_english_idx += 1
+                    processed += 1
+                    if progress_counter is not None:
+                        try:
+                            with progress_counter.get_lock():
+                                progress_counter.value += 1
+                        except Exception:
+                            pass
+                    if flush_every > 0 and (processed % flush_every == 0):
+                        flush()
+    finally:
+        pass
+
+    flush()
 
 
 # ============================================================
@@ -293,35 +482,192 @@ def compute_multi_if_metrics(eval_results: List[Dict[str, Any]]) -> Dict[str, An
 def main(
     model_path: str,
     cuda_id: int = 0,
+    cuda_ids: Optional[str] = None,
     log_dir: Optional[str] = None,
     verbose: bool = False,
     num_sinks: int = 1,
+    flush_every: int = 1,
 ):
     resolved_log_dir = log_dir or os.path.join(PROJECT_ROOT, "logs")
     os.makedirs(resolved_log_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_path = os.path.join(resolved_log_dir, f"multi_if_beacon_{timestamp}.json")
 
+    num_beacons_per_segment: Optional[int] = None
+    try:
+        cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        num_beacons_per_segment = getattr(cfg, "num_beacons_per_segment", None)
+    except Exception as e:
+        print(f"[WARN] Failed to read model config from {model_path}: {e}")
+
+    beacon_part = (
+        f"{int(num_beacons_per_segment)}beacon"
+        if num_beacons_per_segment is not None
+        else "unknownbeacon"
+    )
+    run_tag = f"{beacon_part}_{int(num_sinks)}sink"
+
+    output_path = os.path.join(
+        resolved_log_dir, f"multi_if_beacon_{timestamp}_{run_tag}.json"
+    )
+
+    ds = load_dataset("facebook/Multi-IF")
+
+    cuda_id_list = _parse_cuda_ids(cuda_id=cuda_id, cuda_ids=cuda_ids)
+    _validate_cuda_ids(cuda_id_list)
+
+    split_names, english_indices_by_split = _get_english_indices_by_split(ds)
+    total_english = sum(len(v) for v in english_indices_by_split.values())
+
+    # ============================================================
+    # Multi-GPU: one process per GPU, shard by global_index % num_workers
+    # ============================================================
+    if torch.cuda.is_available() and len(cuda_id_list) > 1:
+        num_workers = len(cuda_id_list)
+        worker_paths = [
+            _worker_output_path(resolved_log_dir, timestamp, run_tag, wid)
+            for wid in range(num_workers)
+        ]
+
+        ctx = mp.get_context("spawn")
+        progress_counter = ctx.Value("i", 0)
+        procs: List[mp.Process] = []
+        for wid, cid in enumerate(cuda_id_list):
+            p = ctx.Process(
+                target=_run_worker,
+                kwargs={
+                    "worker_id": wid,
+                    "num_workers": num_workers,
+                    "cuda_id": cid,
+                    "model_path": model_path,
+                    "num_sinks": num_sinks,
+                    "log_dir": resolved_log_dir,
+                    "timestamp": timestamp,
+                    "run_tag": run_tag,
+                    "split_names": split_names,
+                    "english_indices_by_split": english_indices_by_split,
+                    "verbose": verbose,
+                    "flush_every": flush_every,
+                    "progress_counter": progress_counter,
+                },
+            )
+            p.start()
+            procs.append(p)
+
+        pbar = tqdm(total=total_english, desc="Evaluating Multi-IF (English)", unit="sample")
+        last = 0
+        try:
+            while any(p.is_alive() for p in procs):
+                try:
+                    with progress_counter.get_lock():
+                        current = int(progress_counter.value)
+                except Exception:
+                    current = last
+
+                if current > last:
+                    step = min(current - last, total_english - last)
+                    if step > 0:
+                        pbar.update(step)
+                        last += step
+
+                time.sleep(0.2)
+
+            # Final update after all workers finished.
+            try:
+                with progress_counter.get_lock():
+                    current = int(progress_counter.value)
+            except Exception:
+                current = last
+            if current > last:
+                step = min(current - last, total_english - last)
+                if step > 0:
+                    pbar.update(step)
+                    last += step
+        finally:
+            pbar.close()
+
+        for p in procs:
+            p.join()
+
+        failed_workers = []
+        for wid, p in enumerate(procs):
+            if p.exitcode != 0:
+                failed_workers.append(
+                    {
+                        "worker_id": wid,
+                        "cuda_id": cuda_id_list[wid],
+                        "exitcode": p.exitcode,
+                    }
+                )
+
+        all_eval_results: List[Dict[str, Any]] = []
+        errors: List[Dict[str, Any]] = []
+        for wp in worker_paths:
+            if not os.path.exists(wp):
+                print(f"[WARN] Missing worker output: {wp}")
+                continue
+            try:
+                with open(wp, "r", encoding="utf-8") as f:
+                    d = json.load(f)
+                all_eval_results.extend(d.get("results") or [])
+                errors.extend(d.get("errors") or [])
+            except Exception as e:
+                print(f"[WARN] Failed to read {wp}: {e}")
+
+        all_eval_results.sort(key=lambda r: r.get("global_index", 0))
+        errors.sort(key=lambda r: r.get("global_index", 0))
+
+        metrics = compute_multi_if_metrics(all_eval_results)
+        output = {
+            "meta": {
+                "timestamp": timestamp,
+                "model_path": model_path,
+                "cuda_ids": cuda_id_list,
+                "log_dir": resolved_log_dir,
+                "num_workers": num_workers,
+                "num_splits": len(split_names),
+                "splits": split_names,
+                "total_english": total_english,
+                "run_tag": run_tag,
+                "num_beacons_per_segment": num_beacons_per_segment,
+                "num_sinks": num_sinks,
+                "attempted": len(all_eval_results) + len(errors),
+                "succeeded": len(all_eval_results),
+                "failed": len(errors),
+                "worker_outputs": worker_paths,
+                "failed_workers": failed_workers,
+            },
+            "metrics": metrics,
+            "results": all_eval_results,
+            "errors": errors,
+        }
+        write_json_atomic(output_path, output)
+
+        print("\n=== MULTI-IF (ENGLISH) METRICS ===")
+        print(json.dumps(metrics, indent=2, ensure_ascii=False))
+        print(f"\nSaved to: {output_path}")
+        if failed_workers:
+            raise SystemExit(
+                f"{len(failed_workers)}/{num_workers} workers failed; "
+                f"partial results saved to: {output_path}"
+            )
+        return output_path
+
+    # ============================================================
+    # Single GPU / CPU: keep serial evaluation
+    # ============================================================
     tokenizer = AutoTokenizer.from_pretrained(
         model_path,
         trust_remote_code=True,
         fix_mistral_regex=True,
     )
-
     model, device = load_beacon_model(
         model_path,
-        device_id=cuda_id,
-        num_sinks=num_sinks
+        device_id=int(cuda_id_list[0]) if cuda_id_list else cuda_id,
+        num_sinks=num_sinks,
     )
 
-    ds = load_dataset("facebook/Multi-IF")
-    ds_en = ds.filter(lambda x: str(x.get("language", "")).lower() == "english")
-
-    split_names = list(ds_en.keys())
-    total = sum(len(ds_en[s]) for s in split_names)
-
-    all_eval_results: List[Dict[str, Any]] = []
-    errors: List[Dict[str, Any]] = []
+    all_eval_results = []
+    errors = []
 
     def flush() -> None:
         metrics = compute_multi_if_metrics(all_eval_results)
@@ -329,10 +675,14 @@ def main(
             "meta": {
                 "timestamp": timestamp,
                 "model_path": model_path,
-                "cuda_id": cuda_id,
+                "cuda_id": int(cuda_id_list[0]) if cuda_id_list else cuda_id,
                 "log_dir": resolved_log_dir,
                 "num_splits": len(split_names),
                 "splits": split_names,
+                "total_english": total_english,
+                "run_tag": run_tag,
+                "num_beacons_per_segment": num_beacons_per_segment,
+                "num_sinks": num_sinks,
                 "attempted": len(all_eval_results) + len(errors),
                 "succeeded": len(all_eval_results),
                 "failed": len(errors),
@@ -348,13 +698,15 @@ def main(
 
     flush()
 
-    pbar = tqdm(total=total, desc="Evaluating Multi-IF (English)", unit="sample")
+    pbar = tqdm(total=total_english, desc="Evaluating Multi-IF (English)", unit="sample")
     try:
+        global_english_idx = 0
+        processed = 0
         for split in split_names:
-            split_ds = ds_en[split]
-            for idx in range(len(split_ds)):
-                sample = split_ds[idx]
-                pbar.set_postfix(split=split, idx=idx)
+            orig_indices = english_indices_by_split.get(split) or []
+            for en_idx, orig_idx in enumerate(orig_indices):
+                sample = ds[split][orig_idx]
+                pbar.set_postfix(split=split, idx=en_idx)
                 try:
                     generated_responses = run_multi_if_sample(
                         sample=sample,
@@ -363,28 +715,36 @@ def main(
                         device=device,
                         verbose=verbose,
                     )
-
                     eval_result = eval_multi_if_sample(
                         sample=sample,
                         generated_responses=generated_responses,
                     )
                     eval_result["split"] = split
-                    eval_result["index"] = idx
+                    eval_result["index"] = en_idx
+                    eval_result["orig_index"] = orig_idx
+                    eval_result["global_index"] = global_english_idx
                     all_eval_results.append(eval_result)
                 except Exception as e:
                     errors.append(
                         {
                             "split": split,
-                            "index": idx,
+                            "index": en_idx,
+                            "orig_index": orig_idx,
+                            "global_index": global_english_idx,
                             "key": sample.get("key"),
                             "error": repr(e),
                         }
                     )
                 finally:
+                    global_english_idx += 1
+                    processed += 1
                     pbar.update(1)
-                    flush()
+                    if flush_every > 0 and (processed % flush_every == 0):
+                        flush()
     finally:
         pbar.close()
+
+    flush()
 
     metrics = compute_multi_if_metrics(all_eval_results)
     print("\n=== MULTI-IF (ENGLISH) METRICS ===")
