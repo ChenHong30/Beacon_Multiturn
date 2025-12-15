@@ -17,7 +17,6 @@ import torch.distributed as dist
 from datasets import DatasetDict, load_dataset, load_from_disk, concatenate_datasets
 from transformers import AutoTokenizer, Trainer, TrainingArguments, TrainerCallback, AutoConfig
 
-from modeling_qwen2 import Qwen2ForCausalLM
 from modeling_qwen3 import Qwen3ForCausalLM
 
 logger = logging.getLogger(__name__)
@@ -660,15 +659,9 @@ def main() -> None:
         config.num_sinks = args.num_sinks
         logger.info(f"Using {args.num_sinks} sink tokens per turn")
 
-        if config.model_type == "qwen2":
-            model_cls = Qwen2ForCausalLM
-            logger.info("Detected Qwen2 architecture. Using Qwen2ForCausalLM.")
-        elif config.model_type == "qwen3":
+        if config.model_type == "qwen3":
             model_cls = Qwen3ForCausalLM
             logger.info("Detected Qwen3 architecture. Using Qwen3ForCausalLM.")
-        else:
-            logger.warning(f"Unknown model type: {config.model_type}. Defaulting to Qwen2ForCausalLM.")
-            model_cls = Qwen2ForCausalLM
 
         # 检测可用GPU数量
         n_gpus = torch.cuda.device_count()
