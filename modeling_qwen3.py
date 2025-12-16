@@ -58,6 +58,71 @@ from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 logger = logging.get_logger(__name__)
 
 
+def compute_beacon_alignment_loss(
+    hidden_states: torch.Tensor,  # [batch, seq_len, hidden_dim]
+    beacon_positions: torch.Tensor,  # [batch, seq_len] bool
+    qa_segments: list,  # list of list of (seg_start, seg_end) tuples
+    num_beacons_per_segment: int,
+) -> torch.Tensor:
+    """
+    Compute alignment loss between beacon representations and original segment representations.
+    
+    For each segment:
+    - segment body: tokens from seg_start to first_beacon (exclusive)
+    - beacons: tokens from first_beacon to seg_end (inclusive)
+    
+    Loss = mean(1 - cosine_similarity(beacon_repr, segment_repr))
+    
+    Args:
+        hidden_states: Hidden states from the model, shape [batch, seq_len, hidden_dim]
+        beacon_positions: Boolean tensor indicating beacon token positions, shape [batch, seq_len]
+        qa_segments: List of segments for each batch item, where each segment is (seg_start, seg_end)
+        num_beacons_per_segment: Number of beacon tokens per segment
+    
+    Returns:
+        Alignment loss scalar tensor
+    """
+    import torch.nn.functional as F
+    
+    total_loss = 0.0
+    count = 0
+    
+    batch_size = hidden_states.shape[0]
+    
+    for b in range(batch_size):
+        if qa_segments is None or b >= len(qa_segments):
+            continue
+            
+        for (seg_start, seg_end) in qa_segments[b]:
+            first_beacon = seg_end - (num_beacons_per_segment - 1)
+            
+            # Skip if segment body is empty
+            if seg_start >= first_beacon:
+                continue
+            
+            # Segment body hidden states (before beacons)
+            body_hidden = hidden_states[b, seg_start:first_beacon, :]  # [body_len, hidden_dim]
+            segment_repr = body_hidden.mean(dim=0)  # [hidden_dim]
+            
+            # Beacon hidden states
+            beacon_hidden = hidden_states[b, first_beacon:seg_end+1, :]  # [num_beacons, hidden_dim]
+            beacon_repr = beacon_hidden.mean(dim=0)  # [hidden_dim]
+            
+            # Cosine similarity loss
+            cos_sim = F.cosine_similarity(
+                beacon_repr.unsqueeze(0), 
+                segment_repr.unsqueeze(0)
+            )
+            loss = 1 - cos_sim
+            total_loss = total_loss + loss
+            count += 1
+    
+    if count == 0:
+        return torch.tensor(0.0, device=hidden_states.device, requires_grad=True)
+    
+    return total_loss / count
+
+
 @use_kernel_forward_from_hub("RMSNorm")
 class Qwen3RMSNorm(nn.Module):
     def __init__(self, hidden_size, eps: float = 1e-6) -> None:
@@ -1210,6 +1275,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
             past_key_values=past_key_values if use_cache else None,
         )
         outputs.beacon_positions = beacon_positions
+        outputs.qa_segments = qa_segments
         if labels is not None:
             outputs.adjusted_labels = labels
 
@@ -1534,6 +1600,24 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             if hasattr(outputs, "adjusted_labels"):
                 labels = outputs.adjusted_labels
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+            
+            # Compute beacon alignment loss during training
+            if self.training and hasattr(outputs, 'beacon_positions') and outputs.beacon_positions is not None:
+                if torch.any(outputs.beacon_positions) and hasattr(outputs, 'qa_segments') and outputs.qa_segments is not None:
+                    # Get beacon alignment weight from config (default to 0.1 if not set)
+                    beacon_alignment_weight = getattr(self.config, 'beacon_alignment_weight', 0.1)
+                    
+                    # Compute alignment loss
+                    alignment_loss = compute_beacon_alignment_loss(
+                        hidden_states=outputs.last_hidden_state,
+                        beacon_positions=outputs.beacon_positions,
+                        qa_segments=outputs.qa_segments,
+                        num_beacons_per_segment=self.model.num_beacons_per_segment,
+                    )
+                    
+                    # Add alignment loss to main loss
+                    if alignment_loss > 0:
+                        loss = loss + beacon_alignment_weight * alignment_loss
 
         return CausalLMOutputWithPast(
             loss=loss,

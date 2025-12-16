@@ -192,6 +192,12 @@ def parse_args() -> argparse.Namespace:
         help="Number of sink tokens to retain at the beginning of each turn (default: 4).",
     )
     parser.add_argument(
+        "--beacon-alignment-weight",
+        type=float,
+        default=0.1,
+        help="Weight for beacon alignment loss (default: 0.1). Set to 0 to disable alignment loss.",
+    )
+    parser.add_argument(
         "--resume-from-checkpoint",
         type=str,
         default=None,
@@ -658,6 +664,10 @@ def main() -> None:
         # 设置 sink token 数量
         config.num_sinks = args.num_sinks
         logger.info(f"Using {args.num_sinks} sink tokens per turn")
+
+        # 设置 beacon alignment loss 权重
+        config.beacon_alignment_weight = args.beacon_alignment_weight
+        logger.info(f"Using beacon alignment weight: {args.beacon_alignment_weight}")
 
         if config.model_type == "qwen3":
             model_cls = Qwen3ForCausalLM

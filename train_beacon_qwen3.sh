@@ -26,6 +26,7 @@ WARMUP_RATIO="0.03" # The warmup ratio
 SAVE_STEPS="500" # The number of steps between saving model checkpoints
 NUM_BEACONS="16" # The number of beacons per conversation turn
 NUM_SINKS="4" # The number of sinks per conversation turn
+BEACON_ALIGNMENT_WEIGHT="0.1" # The weight for beacon alignment loss (default: 0.1)
 
 # Determine the number of GPUs available
 if [ -z "$CUDA_VISIBLE_DEVICES" ]; then
@@ -50,6 +51,7 @@ echo "Warmup ratio: $WARMUP_RATIO"
 echo "Epochs: $NUM_EPOCHS"
 echo "Num beacons: $NUM_BEACONS"
 echo "Num sinks: $NUM_SINKS"
+echo "Beacon alignment weight: $BEACON_ALIGNMENT_WEIGHT"
 echo "========================================"
 
 if [ "$N_GPUS" -gt 1 ]; then
@@ -71,6 +73,7 @@ if [ "$N_GPUS" -gt 1 ]; then
         --save-steps $SAVE_STEPS \
         --num-beacons $NUM_BEACONS \
         --num-sinks $NUM_SINKS \
+        --beacon-alignment-weight $BEACON_ALIGNMENT_WEIGHT \
         --bf16 \
         --train-beacon-only \
         --gradient-checkpointing \
@@ -91,6 +94,7 @@ else
         --save-steps $SAVE_STEPS \
         --num-beacons $NUM_BEACONS \
         --num-sinks $NUM_SINKS \
+        --beacon-alignment-weight $BEACON_ALIGNMENT_WEIGHT \
         --bf16 \
         --train-beacon-only \
         --train-lm-head \
