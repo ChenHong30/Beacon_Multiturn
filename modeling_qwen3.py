@@ -84,7 +84,7 @@ def compute_beacon_alignment_loss(
     """
     import torch.nn.functional as F
     
-    total_loss = 0.0
+    total_loss = torch.tensor(0.0, device=hidden_states.device, dtype=hidden_states.dtype, requires_grad=True)
     count = 0
     
     batch_size = hidden_states.shape[0]
