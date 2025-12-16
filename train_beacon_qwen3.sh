@@ -14,7 +14,7 @@ cd "$SCRIPT_DIR"
 
 # Parameters
 MODEL_PATH="/home/hkustgz/model_weights/Qwen3-8B" # The path of base model, it can be a local path or a model name from Hugging Face
-DATA_PATHS="ultrachat-200k-le4turns1.jsonl" # The path(s) of training data, can be multiple paths separated by space
+DATA_PATHS="ultrachat-200k-le4turns.jsonl" # The path(s) of training data, can be multiple paths separated by space
 OUTPUT_DIR="/data/hkustgz/model_weight/16_beacon_4_sink" # The output directory to save trained model and logs
 PROCESSED_CACHE_DIR="./runs/dataset_cache" # The directory to cache processed datasets
 MAX_LENGTH="4096" # The maximum sequence length

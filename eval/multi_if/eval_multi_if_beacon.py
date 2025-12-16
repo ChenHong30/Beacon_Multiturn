@@ -46,7 +46,7 @@ def load_beacon_model(model_path: str, device_id: int = 0, num_sinks: int = 1):
     model = BeaconQwen3ForCausalLM.from_pretrained(
         model_path,
         config=config,
-        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+        dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
         device_map=None,
         attn_implementation="eager",
     )
