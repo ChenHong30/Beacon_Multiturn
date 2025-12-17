@@ -1201,8 +1201,9 @@ class Qwen3Model(Qwen3PreTrainedModel):
         hidden_states = self.norm(hidden_states)
 
         # 维护KV cache压缩（只保留beacon token的KV）
+        # 修复：仅在prefill阶段执行压缩，避免decoding阶段重复压缩
         if (use_cache and enable_beacon_compression and beacon_positions is not None and
-            torch.any(beacon_positions) and past_key_values is not None and past_key_values.get_seq_length() > 0):
+            torch.any(beacon_positions) and past_key_values is not None and past_key_values.get_seq_length() > 0 and is_prefill):
             past_key_values = self.compress_kv_cache(past_key_values, beacon_positions, qa_segments)
 
         outputs = BaseModelOutputWithPast(
