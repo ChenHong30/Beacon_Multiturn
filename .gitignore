@@ -11,3 +11,4 @@ Qwen2-1.5B-Instruct
 Qwen3-0.6B
 modeling_qwen2.py
 train_beacon.sh
+test_attention.py

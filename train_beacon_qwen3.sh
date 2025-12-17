@@ -14,9 +14,9 @@ cd "$SCRIPT_DIR"
 
 # Parameters
 MODEL_PATH="/home/hkustgz/model_weights/Qwen3-8B" # The path of base model, it can be a local path or a model name from Hugging Face
-DATA_PATHS="ultrachat-200k-le4turns.jsonl" # The path(s) of training data, can be multiple paths separated by space
-OUTPUT_DIR="/data/hkustgz/model_weight/16_beacon_4_sink" # The output directory to save trained model and logs
-PROCESSED_CACHE_DIR="./runs/dataset_cache" # The directory to cache processed datasets
+DATA_PATHS="ultrachat-40k-le3turns-turnwise.jsonl" # The path(s) of training data, can be multiple paths separated by space
+OUTPUT_DIR="/data/hkustgz/model_weight/8_beacon_4_sink" # The output directory to save trained model and logs
+PROCESSED_CACHE_DIR="./runs/dataset_cache_40k" # The directory to cache processed datasets
 MAX_LENGTH="4096" # The maximum sequence length
 BATCH_SIZE="1" # The batch size per device
 GRAD_ACCUM="2" # The number of gradient accumulation steps
@@ -24,8 +24,9 @@ LEARNING_RATE="5e-5" # The learning rate
 NUM_EPOCHS="2" # The number of training epochs
 WARMUP_RATIO="0.03" # The warmup ratio
 SAVE_STEPS="500" # The number of steps between saving model checkpoints
-NUM_BEACONS="16" # The number of beacons per conversation turn
+NUM_BEACONS="8" # The number of beacons per conversation turn
 NUM_SINKS="4" # The number of sinks per conversation turn
+BEACON_RECON_WEIGHT="0.3" # Weight for auxiliary beacon reconstruction loss
 
 # Determine the number of GPUs available
 if [ -z "$CUDA_VISIBLE_DEVICES" ]; then
@@ -50,6 +51,7 @@ echo "Warmup ratio: $WARMUP_RATIO"
 echo "Epochs: $NUM_EPOCHS"
 echo "Num beacons: $NUM_BEACONS"
 echo "Num sinks: $NUM_SINKS"
+echo "Beacon recon weight: $BEACON_RECON_WEIGHT"
 echo "========================================"
 
 if [ "$N_GPUS" -gt 1 ]; then
@@ -71,6 +73,7 @@ if [ "$N_GPUS" -gt 1 ]; then
         --save-steps $SAVE_STEPS \
         --num-beacons $NUM_BEACONS \
         --num-sinks $NUM_SINKS \
+        --beacon-recon-weight $BEACON_RECON_WEIGHT \
         --bf16 \
         --train-beacon-only \
         --gradient-checkpointing \
@@ -91,6 +94,7 @@ else
         --save-steps $SAVE_STEPS \
         --num-beacons $NUM_BEACONS \
         --num-sinks $NUM_SINKS \
+        --beacon-recon-weight $BEACON_RECON_WEIGHT \
         --bf16 \
         --train-beacon-only \
         --train-lm-head \

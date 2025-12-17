@@ -1129,7 +1129,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
 
         # === Beacon Mask Logic (防止训练时"作弊") ===
-        # 强制后续token无法看到历史段落的原始文本，只能看到beacon
+        # 强制后续 token 无法看到历史段落的 body（被压缩/驱逐部分），只能看到 sinks + beacons。
         if qa_segments is not None and "full_attention" in causal_mask_mapping:
             current_mask = causal_mask_mapping["full_attention"]
             seq_len = inputs_embeds.shape[1]
@@ -1154,15 +1154,19 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
                     first_beacon = end_i - (self.num_beacons_per_segment - 1)  # 第一个 beacon 的位置
 
-                    # 只有当Body非空时才需要遮蔽
-                    if start_i < first_beacon:
-                        # 1. 后续 tokens 看不到历史 body（只能看到 beacons）
+                    # 训练/推理对齐：推理时 KV 压缩会保留每段开头的 sinks tokens，
+                    # 因此训练时不应把 sinks 区域遮蔽掉，否则模型推理阶段突然“看到” sinks 会很突兀。
+                    mask_start = min(start_i + self.num_sinks, first_beacon)
+
+                    # 只有当被驱逐的 body（除 sinks 外）非空时才需要遮蔽
+                    if mask_start < first_beacon:
+                        # 1. 后续 tokens 看不到历史 body（只能看到 sinks + beacons）
                         if end_i + 1 < seq_len:
-                            current_mask[b, 0, end_i + 1:, start_i : first_beacon] = min_val
+                            current_mask[b, 0, end_i + 1:, mask_start:first_beacon] = min_val
 
                             # 同步更新sliding window mask (如果存在)
                             if "sliding_attention" in causal_mask_mapping and causal_mask_mapping["sliding_attention"] is not None:
-                                causal_mask_mapping["sliding_attention"][b, 0, end_i + 1:, start_i : first_beacon] = min_val
+                                causal_mask_mapping["sliding_attention"][b, 0, end_i + 1:, mask_start:first_beacon] = min_val
 
                         # 2. === 关键修复：让同一 segment 内的 beacons 能双向 attend ===
                         # 在 causal mask 中，后面的 beacon 已经能看到前面的 beacon
@@ -1200,6 +1204,56 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
         hidden_states = self.norm(hidden_states)
 
+        # === Beacon Reconstruction Loss (aux) ===
+        # 让每个 beacon 直接重建其负责 chunk 的平均语义表示，缩短梯度路径。
+        beacon_recon_loss = None
+        beacon_recon_weight = float(getattr(self.config, "beacon_recon_weight", 0.0) or 0.0)
+        if (
+            beacon_recon_weight > 0.0
+            and qa_segments is not None
+            and beacon_positions is not None
+            and torch.any(beacon_positions)
+        ):
+            recon_losses: list[torch.Tensor] = []
+            batch_size = hidden_states.shape[0]
+            seq_len = hidden_states.shape[1]
+            num_beacons = self.num_beacons_per_segment
+
+            for b in range(min(batch_size, len(qa_segments))):
+                for (start_i, end_i) in qa_segments[b]:
+                    first_beacon = end_i - (num_beacons - 1)
+                    if first_beacon < 0 or first_beacon >= seq_len:
+                        continue
+
+                    # 与 mask/压缩逻辑对齐：只重建会被驱逐的 body（不包含 sinks 和 beacons）
+                    body_start = min(start_i + self.num_sinks, first_beacon)
+                    body_end = first_beacon
+                    body_len = body_end - body_start
+                    if body_len <= 0:
+                        continue
+
+                    for j in range(num_beacons):
+                        chunk_start = body_start + (j * body_len) // num_beacons
+                        chunk_end = body_start + ((j + 1) * body_len) // num_beacons
+                        if chunk_end <= chunk_start:
+                            continue
+
+                        beacon_idx = first_beacon + j
+                        if beacon_idx < 0 or beacon_idx >= seq_len:
+                            continue
+
+                        target = hidden_states[b, chunk_start:chunk_end, :].mean(dim=0).detach()
+                        beacon_vec = hidden_states[b, beacon_idx, :]
+
+                        beacon_norm = nn.functional.normalize(beacon_vec.float(), dim=0, eps=1e-6)
+                        target_norm = nn.functional.normalize(target.float(), dim=0, eps=1e-6)
+                        recon_losses.append(1.0 - (beacon_norm * target_norm).sum())
+
+            if recon_losses:
+                beacon_recon_loss = torch.stack(recon_losses).mean()
+            else:
+                beacon_recon_loss = hidden_states.new_tensor(0.0)
+
         # 维护KV cache压缩（只保留beacon token的KV）
         # 修复：仅在prefill阶段执行压缩，避免decoding阶段重复压缩
         if (use_cache and enable_beacon_compression and beacon_positions is not None and
@@ -1211,6 +1265,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
             past_key_values=past_key_values if use_cache else None,
         )
         outputs.beacon_positions = beacon_positions
+        outputs.beacon_recon_loss = beacon_recon_loss
         if labels is not None:
             outputs.adjusted_labels = labels
 
@@ -1535,6 +1590,13 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             if hasattr(outputs, "adjusted_labels"):
                 labels = outputs.adjusted_labels
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+            beacon_recon_weight = float(getattr(self.config, "beacon_recon_weight", 0.0) or 0.0)
+            if (
+                beacon_recon_weight > 0.0
+                and hasattr(outputs, "beacon_recon_loss")
+                and outputs.beacon_recon_loss is not None
+            ):
+                loss = loss + beacon_recon_weight * outputs.beacon_recon_loss
 
         return CausalLMOutputWithPast(
             loss=loss,
