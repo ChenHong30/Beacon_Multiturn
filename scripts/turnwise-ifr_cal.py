@@ -81,7 +81,7 @@ def compute_strict_follow(input_path):
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description="Compute per-turn strict-follow averages from a log JSON file or directory")
-    p.add_argument("--logdir", default="logs", help="Directory containing log json files (default: logs)")
+    p.add_argument("--log", default="logs", help="Directory containing log json files (default: logs)")
     p.add_argument("--file", help="Path to a single log file to process (overrides --logdir)")
     args = p.parse_args()
     path = args.file if args.file else args.logdir

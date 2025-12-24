@@ -1,11 +1,11 @@
 #!/bin/bash
 
 IS_BEACON=true
-BEACON_MODEL_PATH="/data/hkustgz/model_weight/16_beacon_4_sink"
-BASE_MODEL_PATH="/home/hkustgz/model_weights/Qwen3-8B"
+BEACON_MODEL_PATH="/data/hkustgz/model_weight/8_beacon_4_sink_0.6B_beacon_CE_1e-4"
+BASE_MODEL_PATH="/data/hkustgz/model_weight/Qwen3-0.6B"
 CUDA_ID=0,1,2,3
-LOG_DIR="/home/hkustgz/Beacon_Multiturn/logs"
-NUM_SINKS=1
+LOG_DIR="/home/hkustgz/Beacon_Multiturn/logs/8_beacon_4_sink_0.6B_beacon_CE_1e-4"
+NUM_SINKS=4
 BEACON_SCRIPT="eval/multi_if/eval_multi_if_beacon.py"
 BASE_SCRIPT="eval/multi_if/eval_multi_if_base.py"
 
@@ -53,11 +53,9 @@ else
     # Case 2: Run Base Script
     # ------------------------------------
     echo "▶️   Running Base Evaluation script: $BASE_SCRIPT"
-    # Base script only supports single GPU; take the first id if a list is provided (e.g. "0,1,2,3").
-    FIRST_CUDA_ID="$(echo "$CUDA_ID" | sed 's/[ ,].*$//')"
     
     python "$BASE_SCRIPT" \
         --model_path="$BASE_MODEL_PATH" \
-        --cuda_id="$FIRST_CUDA_ID" \
+        --cuda_ids="$CUDA_ID" \
         --log_dir="$LOG_DIR"
 fi
