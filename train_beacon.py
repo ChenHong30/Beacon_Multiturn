@@ -198,19 +198,6 @@ def parse_args() -> argparse.Namespace:
         help="Weight for auxiliary beacon reconstruction loss (default: 0.0, disabled).",
     )
     parser.add_argument(
-        "--beacon-ce-weight",
-        type=float,
-        default=0.0,
-        help="Weight for auxiliary beacon token prediction loss (default: 0.0, disabled).",
-    )
-    parser.add_argument(
-        "--beacon-label-mode",
-        type=str,
-        default="chunk_last",
-        choices=["chunk_last", "chunk_mid"],
-        help="How to pick the target token for each beacon (default: chunk_last).",
-    )
-    parser.add_argument(
         "--resume-from-checkpoint",
         type=str,
         default=None,
@@ -558,10 +545,6 @@ def generate_loss_plot(metrics_json_path: str, plot_path: str) -> None:
     logger.info("Saved loss plot to %s", plot_path)
 
 
-class BeaconTrainer(Trainer):
-    pass
-
-
 class BeaconDataCollator:
     """
     Pads variable-length chat examples while preserving precomputed labels.
@@ -686,12 +669,6 @@ def main() -> None:
         config.beacon_recon_weight = float(args.beacon_recon_weight)
         logger.info("Beacon recon weight: %.4f", config.beacon_recon_weight)
 
-        # beacon token prediction aux loss
-        config.beacon_ce_weight = float(args.beacon_ce_weight)
-        config.beacon_label_mode = args.beacon_label_mode
-        logger.info("Beacon CE weight: %.4f", config.beacon_ce_weight)
-        logger.info("Beacon label mode: %s", config.beacon_label_mode)
-
         if config.model_type == "qwen3":
             model_cls = Qwen3ForCausalLM
             logger.info("Detected Qwen3 architecture. Using Qwen3ForCausalLM.")
@@ -714,9 +691,6 @@ def main() -> None:
             # FlashAttention 不支持复杂的自定义 attention mask
             attn_implementation="eager",
         )
-        model.config.beacon_recon_weight = config.beacon_recon_weight
-        model.config.beacon_ce_weight = config.beacon_ce_weight
-        model.config.beacon_label_mode = config.beacon_label_mode
         model.config.use_cache = False
 
         if args.gradient_checkpointing:
@@ -792,7 +766,7 @@ def main() -> None:
         }
         metrics_callback = JsonMetricsCallback(metrics_json_path, params_for_json)
 
-        trainer = BeaconTrainer(
+        trainer = Trainer(
             model=model,
             args=training_args,
             train_dataset=train_dataset,

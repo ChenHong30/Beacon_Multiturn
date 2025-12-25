@@ -1254,85 +1254,6 @@ class Qwen3Model(Qwen3PreTrainedModel):
             else:
                 beacon_recon_loss = hidden_states.new_tensor(0.0)
 
-        # === Beacon Token Prediction Targets (aux) ===
-        beacon_ce_batch = None
-        beacon_ce_positions = None
-        beacon_ce_targets = None
-        beacon_ce_weight = float(getattr(self.config, "beacon_ce_weight", 0.0) or 0.0)
-        beacon_label_mode = getattr(self.config, "beacon_label_mode", "chunk_last")
-        if (
-            beacon_ce_weight > 0.0
-            and qa_segments is not None
-            and beacon_positions is not None
-            and torch.any(beacon_positions)
-            and input_ids is not None
-        ):
-            batch_indices: list[int] = []
-            pos_indices: list[int] = []
-            target_ids: list[int] = []
-            pad_id = getattr(self.config, "pad_token_id", None)
-            special_ids = {
-                self.im_start_id,
-                self.im_end_id,
-                self.system_id,
-                self.user_id,
-                self.assistant_id,
-                self.beacon_token_id,
-            }
-            if pad_id is not None:
-                special_ids.add(pad_id)
-
-            batch_size = input_ids.shape[0]
-            seq_len = input_ids.shape[1]
-            num_beacons = self.num_beacons_per_segment
-
-            for b in range(min(batch_size, len(qa_segments))):
-                for (start_i, end_i) in qa_segments[b]:
-                    first_beacon = end_i - (num_beacons - 1)
-                    if first_beacon < 0 or first_beacon >= seq_len:
-                        continue
-
-                    body_start = min(start_i + self.num_sinks, first_beacon)
-                    body_end = first_beacon
-                    body_len = body_end - body_start
-                    if body_len <= 0:
-                        continue
-
-                    for j in range(num_beacons):
-                        chunk_start = body_start + (j * body_len) // num_beacons
-                        chunk_end = body_start + ((j + 1) * body_len) // num_beacons
-                        if chunk_end <= chunk_start:
-                            continue
-
-                        beacon_idx = first_beacon + j
-                        if beacon_idx < 0 or beacon_idx >= seq_len:
-                            continue
-
-                        if beacon_label_mode == "chunk_mid":
-                            target_pos = (chunk_start + chunk_end - 1) // 2
-                        else:
-                            target_pos = chunk_end - 1
-
-                        pos = target_pos
-                        token_id = None
-                        while pos >= chunk_start:
-                            token_id = int(input_ids[b, pos].item())
-                            if token_id not in special_ids:
-                                break
-                            pos -= 1
-                        if pos < chunk_start or token_id is None:
-                            continue
-
-                        batch_indices.append(b)
-                        pos_indices.append(beacon_idx)
-                        target_ids.append(token_id)
-
-            if target_ids:
-                device = hidden_states.device
-                beacon_ce_batch = torch.tensor(batch_indices, device=device, dtype=torch.long)
-                beacon_ce_positions = torch.tensor(pos_indices, device=device, dtype=torch.long)
-                beacon_ce_targets = torch.tensor(target_ids, device=device, dtype=torch.long)
-
         # 维护KV cache压缩（只保留beacon token的KV）
         # 修复：仅在prefill阶段执行压缩，避免decoding阶段重复压缩
         if (use_cache and enable_beacon_compression and beacon_positions is not None and
@@ -1345,9 +1266,6 @@ class Qwen3Model(Qwen3PreTrainedModel):
         )
         outputs.beacon_positions = beacon_positions
         outputs.beacon_recon_loss = beacon_recon_loss
-        outputs.beacon_ce_batch = beacon_ce_batch
-        outputs.beacon_ce_positions = beacon_ce_positions
-        outputs.beacon_ce_targets = beacon_ce_targets
         if labels is not None:
             outputs.adjusted_labels = labels
 
@@ -1668,13 +1586,10 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         logits = self.lm_head(hidden_states[:, slice_indices, :])
 
         loss = None
-        lm_loss = None
-        beacon_ce_loss = None
         if labels is not None:
             if hasattr(outputs, "adjusted_labels"):
                 labels = outputs.adjusted_labels
-            lm_loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
-            loss = lm_loss
+            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
             beacon_recon_weight = float(getattr(self.config, "beacon_recon_weight", 0.0) or 0.0)
             if (
                 beacon_recon_weight > 0.0
@@ -1682,33 +1597,14 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                 and outputs.beacon_recon_loss is not None
             ):
                 loss = loss + beacon_recon_weight * outputs.beacon_recon_loss
-            beacon_ce_weight = float(getattr(self.config, "beacon_ce_weight", 0.0) or 0.0)
-            if (
-                beacon_ce_weight > 0.0
-                and hasattr(outputs, "beacon_ce_targets")
-                and outputs.beacon_ce_targets is not None
-                and outputs.beacon_ce_targets.numel() > 0
-            ):
-                beacon_hidden = hidden_states[outputs.beacon_ce_batch, outputs.beacon_ce_positions, :]
-                beacon_logits = self.lm_head(beacon_hidden)
-                beacon_ce_loss = nn.functional.cross_entropy(
-                    beacon_logits, outputs.beacon_ce_targets, reduction="mean"
-                )
-                loss = loss + beacon_ce_weight * beacon_ce_loss
-                outputs.beacon_ce_loss = beacon_ce_loss
 
-        final_outputs = CausalLMOutputWithPast(
+        return CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
-        if hasattr(outputs, "beacon_recon_loss"):
-            final_outputs.beacon_recon_loss = outputs.beacon_recon_loss
-        if beacon_ce_loss is not None:
-            final_outputs.beacon_ce_loss = beacon_ce_loss
-        return final_outputs
 
 
 class Qwen3ForSequenceClassification(GenericForSequenceClassification, Qwen3PreTrainedModel):
