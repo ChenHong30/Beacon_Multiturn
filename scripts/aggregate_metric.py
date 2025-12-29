@@ -79,7 +79,7 @@ def compute_multi_if_metrics(eval_results):
     }
 
 def main():
-    log_pattern = "logs/8_beacon_4_sink_0.6B_beacon_CE_1e-4/multi_if_beacon_20251224_220717_8beacon_4sink.worker*.json"
+    log_pattern = "/home/hkustgz/Beacon_Multiturn/logs/8_beacon_4_sink_recon_attention/multi_if_beacon_20251229_111547_8beacon_4sink.worker*.json"
     files = glob.glob(log_pattern)
     
     if not files:

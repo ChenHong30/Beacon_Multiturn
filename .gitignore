@@ -13,3 +13,4 @@ modeling_qwen2.py
 train_beacon.sh
 test_attention.py
 /verification
+model_weight

@@ -90,8 +90,64 @@ class Qwen3MLP(nn.Module):
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def forward(self, x):
-        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        # Beacon token 的独立 MLP 投影矩阵
+        # 初始化为零，在 from_pretrained 中根据 missing_keys 决定是否从原始投影复制
+        self.beacon_gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.beacon_up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.beacon_down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+
+        # 先用零初始化，避免随机初始化导致的不稳定
+        with torch.no_grad():
+            self.beacon_gate_proj.weight.data.zero_()
+            self.beacon_up_proj.weight.data.zero_()
+            self.beacon_down_proj.weight.data.zero_()
+        # 标记为已初始化，防止 post_init() 再次初始化
+        self.beacon_gate_proj._is_hf_initialized = True
+        self.beacon_up_proj._is_hf_initialized = True
+        self.beacon_down_proj._is_hf_initialized = True
+
+    def _init_beacon_mlp(self, missing_keys):
+        """
+        Initialize beacon MLP weights from original MLP.
+        Only called when beacon weights are missing (not loaded from checkpoint).
+        """
+        if any("beacon_gate_proj" in key for key in missing_keys):
+            with torch.no_grad():
+                self.beacon_gate_proj.weight.data.copy_(self.gate_proj.weight.data)
+
+        if any("beacon_up_proj" in key for key in missing_keys):
+            with torch.no_grad():
+                self.beacon_up_proj.weight.data.copy_(self.up_proj.weight.data)
+
+        if any("beacon_down_proj" in key for key in missing_keys):
+            with torch.no_grad():
+                self.beacon_down_proj.weight.data.copy_(self.down_proj.weight.data)
+
+    def forward(self, x, beacon_mask=None):
+        if beacon_mask is not None and torch.any(beacon_mask):
+            # Beacon MLP
+            beacon_output = self.beacon_down_proj(
+                self.act_fn(self.beacon_gate_proj(x)) * self.beacon_up_proj(x)
+            )
+            # Normal MLP
+            normal_output = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+
+            # 根据 beacon_mask 选择输出
+            # beacon_mask: [batch_size, seq_len] -> [batch_size, seq_len, 1]
+            beacon_mask_expanded = beacon_mask.unsqueeze(-1).expand_as(normal_output)
+            down_proj = torch.where(beacon_mask_expanded, beacon_output, normal_output)
+        else:
+            down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+
+            # Fix for DDP unused parameters issue:
+            if self.training and self.beacon_gate_proj.weight.requires_grad:
+                dummy_beacon_mlp = (
+                    self.beacon_gate_proj.weight.sum() +
+                    self.beacon_up_proj.weight.sum() +
+                    self.beacon_down_proj.weight.sum()
+                ) * 0.0
+                down_proj = down_proj + dummy_beacon_mlp
+
         return down_proj
 
 
@@ -503,7 +559,7 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, beacon_mask=beacon_positions)
         hidden_states = residual + hidden_states
         return hidden_states
 
@@ -1205,7 +1261,8 @@ class Qwen3Model(Qwen3PreTrainedModel):
         hidden_states = self.norm(hidden_states)
 
         # === Beacon Reconstruction Loss (aux) ===
-        # 让每个 beacon 直接重建其负责 chunk 的平均语义表示，缩短梯度路径。
+        # 改进版：使用 Retrieval-based Loss，让 beacon 能够"检索"到其 chunk 中的所有 token
+        # 这更符合 LLM 的 attention 原理：beacon 的 K/V 需要能被后续 token 有效 query
         beacon_recon_loss = None
         beacon_recon_weight = float(getattr(self.config, "beacon_recon_weight", 0.0) or 0.0)
         if (
@@ -1242,12 +1299,36 @@ class Qwen3Model(Qwen3PreTrainedModel):
                         if beacon_idx < 0 or beacon_idx >= seq_len:
                             continue
 
-                        target = hidden_states[b, chunk_start:chunk_end, :].mean(dim=0).detach()
-                        beacon_vec = hidden_states[b, beacon_idx, :]
+                        # 获取 chunk 和 beacon 的 hidden states
+                        chunk = hidden_states[b, chunk_start:chunk_end, :].float()  # [chunk_len, hidden_dim]
+                        beacon_vec = hidden_states[b, beacon_idx, :].float()  # [hidden_dim]
 
-                        beacon_norm = nn.functional.normalize(beacon_vec.float(), dim=0, eps=1e-6)
-                        target_norm = nn.functional.normalize(target.float(), dim=0, eps=1e-6)
-                        recon_losses.append(1.0 - (beacon_norm * target_norm).sum())
+                        # 归一化
+                        chunk_norm = nn.functional.normalize(chunk, dim=-1, eps=1e-6)
+                        beacon_norm = nn.functional.normalize(beacon_vec.unsqueeze(0), dim=-1, eps=1e-6)
+
+                        # 计算 beacon 与 chunk 中每个 token 的相似度
+                        similarities = torch.matmul(beacon_norm, chunk_norm.T).squeeze(0)  # [chunk_len]
+
+                        # Attention-weighted pooling：beacon 应该能覆盖整个 chunk
+                        attn_weights = nn.functional.softmax(similarities, dim=0)
+                        weighted_chunk = torch.matmul(attn_weights, chunk)  # [hidden_dim]
+
+                        # Loss 1: Beacon 向量应该接近 attention-weighted 的 chunk 表示
+                        weighted_chunk_norm = nn.functional.normalize(weighted_chunk.unsqueeze(0), dim=-1, eps=1e-6)
+                        cosine_loss = 1.0 - torch.matmul(beacon_norm, weighted_chunk_norm.T).squeeze()
+
+                        # Loss 2: 鼓励 beacon attend 到更多 token（高熵 = 均匀分布）
+                        # 防止 beacon 只关注少数 token 而忽略其他关键信息
+                        entropy = -(attn_weights * torch.log(attn_weights + 1e-8)).sum()
+                        max_entropy = torch.log(torch.tensor(float(chunk_end - chunk_start), device=entropy.device))
+                        # 归一化熵到 [0, 1]，然后取负（我们希望高熵）
+                        normalized_entropy = entropy / (max_entropy + 1e-8)
+                        entropy_loss = 1.0 - normalized_entropy  # 熵越高，loss 越低
+
+                        # 组合 loss：主要是 cosine loss，entropy 作为正则项
+                        combined_loss = cosine_loss + 0.1 * entropy_loss
+                        recon_losses.append(combined_loss)
 
             if recon_losses:
                 beacon_recon_loss = torch.stack(recon_losses).mean()
@@ -1468,10 +1549,12 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             # 传入tokenizer以使用语义词汇的embedding平均值
             model.model.extend_embeddings_for_beacon(tokenizer=tokenizer)
 
-            # 初始化每层的beacon投影矩阵
+            # 初始化每层的beacon投影矩阵和MLP
             for layer in model.model.layers:
                 if hasattr(layer.self_attn, '_init_beacon_proj'):
                     layer.self_attn._init_beacon_proj(missing_keys)
+                if hasattr(layer.mlp, '_init_beacon_mlp'):
+                    layer.mlp._init_beacon_mlp(missing_keys)
 
             print(f"\033[93m[from_pretrained] Initialized beacon parameters from original projections (warm start)\033[0m")
         else:
@@ -1502,6 +1585,11 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             if hasattr(layer.self_attn, 'beacon_q_norm'):
                 layer.self_attn.beacon_q_norm = layer.self_attn.beacon_q_norm.to(dtype=target_dtype, device=target_device)
                 layer.self_attn.beacon_k_norm = layer.self_attn.beacon_k_norm.to(dtype=target_dtype, device=target_device)
+            # 转换 beacon MLP 的数据类型
+            if hasattr(layer.mlp, 'beacon_gate_proj'):
+                layer.mlp.beacon_gate_proj = layer.mlp.beacon_gate_proj.to(dtype=target_dtype, device=target_device)
+                layer.mlp.beacon_up_proj = layer.mlp.beacon_up_proj.to(dtype=target_dtype, device=target_device)
+                layer.mlp.beacon_down_proj = layer.mlp.beacon_down_proj.to(dtype=target_dtype, device=target_device)
 
         return model
 
