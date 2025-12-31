@@ -57,6 +57,11 @@ from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
 logger = logging.get_logger(__name__)
 
+try:
+    _CHECK_MODEL_INPUTS = check_model_inputs()
+except TypeError:
+    _CHECK_MODEL_INPUTS = check_model_inputs
+
 
 @use_kernel_forward_from_hub("RMSNorm")
 class Qwen3RMSNorm(nn.Module):
@@ -1043,7 +1048,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
         return compressed_cache
 
-    @check_model_inputs()
+    @_CHECK_MODEL_INPUTS
     @auto_docstring
     def forward(
         self,

@@ -84,5 +84,5 @@ if __name__ == "__main__":
     p.add_argument("--log", default="logs", help="Directory containing log json files (default: logs)")
     p.add_argument("--file", help="Path to a single log file to process (overrides --logdir)")
     args = p.parse_args()
-    path = args.file if args.file else args.logdir
+    path = args.file if args.file else args.log
     raise SystemExit(compute_strict_follow(path))
