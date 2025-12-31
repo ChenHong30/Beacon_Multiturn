@@ -1246,6 +1246,14 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
                                 if "sliding_attention" in causal_mask_mapping and causal_mask_mapping["sliding_attention"] is not None:
                                     causal_mask_mapping["sliding_attention"][b, 0, beacon_i, beacon_j] = 0.0
+            # 3. === 扩展：所有 beacon 之间双向可见（跨 segment） ===
+            if beacon_positions is not None and torch.any(beacon_positions):
+                for b in range(beacon_positions.shape[0]):
+                    beacon_indices = torch.nonzero(beacon_positions[b], as_tuple=False).squeeze(-1)
+                    if beacon_indices.numel() > 1:
+                        current_mask[b, 0][beacon_indices[:, None], beacon_indices[None, :]] = 0.0
+                        if "sliding_attention" in causal_mask_mapping and causal_mask_mapping["sliding_attention"] is not None:
+                            causal_mask_mapping["sliding_attention"][b, 0][beacon_indices[:, None], beacon_indices[None, :]] = 0.0
 
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
