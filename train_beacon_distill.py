@@ -148,6 +148,30 @@ def parse_args() -> argparse.Namespace:
         help="Weight of the student cross-entropy loss.",
     )
     parser.add_argument(
+        "--beacon-attn-weight",
+        type=float,
+        default=0.0,
+        help="Weight for beacon attention regularization loss (encourages attending to beacons).",
+    )
+    parser.add_argument(
+        "--hidden-distill-weight",
+        type=float,
+        default=0.0,
+        help="Weight for hidden states distillation loss.",
+    )
+    parser.add_argument(
+        "--hidden-distill-layer",
+        type=int,
+        default=-1,
+        help="Which layer's hidden states to distill (-1 for last layer).",
+    )
+    parser.add_argument(
+        "--min-beacon-attn",
+        type=float,
+        default=0.1,
+        help="Minimum attention ratio to beacons (for beacon attention regularization).",
+    )
+    parser.add_argument(
         "--resume-from-checkpoint",
         type=str,
         default=None,
@@ -532,6 +556,10 @@ class DistillTrainer(Trainer):
         distill_weight: float,
         ce_weight: float,
         temperature: float,
+        beacon_attn_weight: float = 0.0,
+        hidden_distill_weight: float = 0.0,
+        hidden_distill_layer: int = -1,
+        min_beacon_attn: float = 0.1,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -539,6 +567,10 @@ class DistillTrainer(Trainer):
         self.distill_weight = distill_weight
         self.ce_weight = ce_weight
         self.temperature = temperature
+        self.beacon_attn_weight = beacon_attn_weight
+        self.hidden_distill_weight = hidden_distill_weight
+        self.hidden_distill_layer = hidden_distill_layer
+        self.min_beacon_attn = min_beacon_attn
         self.kl_loss = torch.nn.KLDivLoss(reduction="batchmean")
 
     @staticmethod
@@ -639,10 +671,175 @@ class DistillTrainer(Trainer):
         kd_loss = self.kl_loss(student_log_probs, teacher_probs) * (temperature * temperature)
         return kd_loss
 
+    def _compute_beacon_attn_loss(
+        self,
+        student_model: torch.nn.Module,
+        input_ids: torch.Tensor,
+        labels: Optional[torch.Tensor],
+        attentions: tuple,
+    ) -> torch.Tensor:
+        """
+        计算beacon注意力正则化损失。
+        鼓励当前轮次的token更多地attend到历史beacons。
+        """
+        if attentions is None or len(attentions) == 0:
+            return input_ids.new_tensor(0.0, dtype=torch.float)
+
+        # 解析对话结构，获取beacon位置和当前轮次位置
+        with torch.no_grad():
+            segment_bounds, modified_input_ids, _, _ = student_model.model.parse_multiturn_dialogue(
+                input_ids, labels
+            )
+
+        beacon_token_id = student_model.model.beacon_token_id
+        batch_size, seq_len = modified_input_ids.shape
+
+        # 找到beacon位置和当前轮次起始位置
+        beacon_mask = (modified_input_ids == beacon_token_id)  # [B, S]
+        
+        total_loss = input_ids.new_tensor(0.0, dtype=torch.float)
+        valid_count = 0
+
+        for b in range(batch_size):
+            bounds = segment_bounds[b]
+            if len(bounds) < 2:
+                continue
+
+            # 当前轮次是最后一个segment
+            current_start = bounds[-1][0]
+            current_end = bounds[-1][1]
+            
+            # 历史beacon位置（不包括当前轮次的beacons，如果有的话）
+            history_beacon_indices = []
+            for seg_idx, (start, end) in enumerate(bounds[:-1]):
+                seg_beacon_mask = beacon_mask[b, start:end]
+                seg_beacon_positions = torch.where(seg_beacon_mask)[0] + start
+                history_beacon_indices.extend(seg_beacon_positions.tolist())
+
+            if len(history_beacon_indices) == 0:
+                continue
+
+            history_beacon_indices = torch.tensor(history_beacon_indices, device=input_ids.device)
+
+            # 对每一层的attention计算beacon注意力
+            for layer_idx, layer_attn in enumerate(attentions):
+                # layer_attn: [B, num_heads, S, S]
+                if layer_attn.shape[2] != seq_len or layer_attn.shape[3] != seq_len:
+                    continue
+
+                # 当前轮次tokens对历史beacons的注意力
+                # 取当前轮次的query positions
+                current_attn = layer_attn[b, :, current_start:current_end, :]  # [H, current_len, S]
+                
+                # 对历史beacons的注意力
+                beacon_attn = current_attn[:, :, history_beacon_indices]  # [H, current_len, num_beacons]
+                avg_beacon_attn = beacon_attn.mean()  # 平均注意力
+
+                # 如果注意力低于阈值，产生loss
+                if avg_beacon_attn < self.min_beacon_attn:
+                    # Hinge loss: max(0, min_attn - actual_attn)
+                    layer_loss = self.min_beacon_attn - avg_beacon_attn
+                    total_loss = total_loss + layer_loss
+                    valid_count += 1
+
+        if valid_count > 0:
+            total_loss = total_loss / valid_count
+
+        return total_loss
+
+    def _compute_hidden_distill_loss(
+        self,
+        student_model: torch.nn.Module,
+        input_ids: torch.Tensor,
+        labels: Optional[torch.Tensor],
+        student_hidden_states: tuple,
+        teacher_hidden_states: tuple,
+    ) -> torch.Tensor:
+        """
+        计算hidden states蒸馏损失。
+        在当前轮次位置，学生和教师的hidden states应该相似。
+        使用cosine similarity loss，对scale不敏感。
+        """
+        if student_hidden_states is None or teacher_hidden_states is None:
+            return input_ids.new_tensor(0.0, dtype=torch.float)
+
+        # 选择要蒸馏的层
+        layer_idx = self.hidden_distill_layer
+        if layer_idx < 0:
+            layer_idx = len(student_hidden_states) + layer_idx
+        
+        if layer_idx < 0 or layer_idx >= len(student_hidden_states):
+            return input_ids.new_tensor(0.0, dtype=torch.float)
+
+        student_hidden = student_hidden_states[layer_idx]  # [B, student_seq_len, D]
+        teacher_hidden = teacher_hidden_states[layer_idx]  # [B, teacher_seq_len, D]
+
+        # 解析对话结构，建立学生到教师的位置映射
+        with torch.no_grad():
+            segment_bounds, modified_input_ids, _, _ = student_model.model.parse_multiturn_dialogue(
+                input_ids, labels
+            )
+
+        beacon_token_id = student_model.model.beacon_token_id
+        batch_size = input_ids.shape[0]
+        teacher_seq_len = teacher_hidden.shape[1]
+        student_seq_len = student_hidden.shape[1]
+
+        total_loss = input_ids.new_tensor(0.0, dtype=torch.float)
+        valid_count = 0
+
+        for b in range(batch_size):
+            # 建立学生位置到教师位置的映射（跳过beacon tokens）
+            mod_ids = modified_input_ids[b].tolist()
+            teacher_idx = 0
+            
+            student_positions = []
+            teacher_positions = []
+            
+            for s_idx, token_id in enumerate(mod_ids):
+                if token_id == beacon_token_id:
+                    continue
+                if teacher_idx >= teacher_seq_len:
+                    break
+                if s_idx >= student_seq_len:
+                    break
+                    
+                # 只对有标签的位置（assistant回复）进行蒸馏
+                if labels is not None and labels[b, teacher_idx].item() != -100:
+                    student_positions.append(s_idx)
+                    teacher_positions.append(teacher_idx)
+                
+                teacher_idx += 1
+
+            if len(student_positions) == 0:
+                continue
+
+            student_positions = torch.tensor(student_positions, device=input_ids.device)
+            teacher_positions = torch.tensor(teacher_positions, device=input_ids.device)
+
+            # 提取对应位置的hidden states
+            student_h = student_hidden[b, student_positions, :]  # [N, D]
+            teacher_h = teacher_hidden[b, teacher_positions, :]  # [N, D]
+
+            # Cosine similarity loss: 1 - cos_sim (越相似loss越小)
+            cos_sim = F.cosine_similarity(student_h.float(), teacher_h.float(), dim=-1)  # [N]
+            loss = (1 - cos_sim).mean()
+            total_loss = total_loss + loss
+            valid_count += 1
+
+        if valid_count > 0:
+            total_loss = total_loss / valid_count
+
+        return total_loss
+
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         input_ids = inputs.get("input_ids")
         attention_mask = inputs.get("attention_mask")
         labels = inputs.get("labels")
+
+        # 判断是否需要额外输出
+        need_attentions = self.beacon_attn_weight > 0.0
+        need_hidden_states = self.hidden_distill_weight > 0.0
 
         with torch.no_grad():
             teacher_outputs = self.teacher_model(
@@ -650,8 +847,10 @@ class DistillTrainer(Trainer):
                 attention_mask=attention_mask,
                 use_cache=False,
                 enable_beacon_compression=False,
+                output_hidden_states=need_hidden_states,
             )
             teacher_logits = teacher_outputs.logits
+            teacher_hidden_states = teacher_outputs.hidden_states if need_hidden_states else None
 
         student_outputs = model(
             input_ids=input_ids,
@@ -659,9 +858,13 @@ class DistillTrainer(Trainer):
             labels=labels,
             use_cache=False,
             enable_beacon_compression=True,
+            output_attentions=need_attentions,
+            output_hidden_states=need_hidden_states,
         )
         student_logits = student_outputs.logits
         ce_loss = student_outputs.loss if labels is not None else None
+        student_attentions = student_outputs.attentions if need_attentions else None
+        student_hidden_states = student_outputs.hidden_states if need_hidden_states else None
 
         student_model = self._unwrap_model(model)
         kd_loss = self._compute_kd_loss(
@@ -678,6 +881,27 @@ class DistillTrainer(Trainer):
             loss = loss + self.distill_weight * kd_loss
         if self.ce_weight > 0.0 and ce_loss is not None:
             loss = loss + self.ce_weight * ce_loss
+
+        # 方案1: Beacon注意力正则化
+        if self.beacon_attn_weight > 0.0 and student_attentions is not None:
+            beacon_attn_loss = self._compute_beacon_attn_loss(
+                student_model=student_model,
+                input_ids=input_ids,
+                labels=labels,
+                attentions=student_attentions,
+            )
+            loss = loss + self.beacon_attn_weight * beacon_attn_loss
+
+        # 方案3: Hidden states蒸馏
+        if self.hidden_distill_weight > 0.0 and student_hidden_states is not None and teacher_hidden_states is not None:
+            hidden_distill_loss = self._compute_hidden_distill_loss(
+                student_model=student_model,
+                input_ids=input_ids,
+                labels=labels,
+                student_hidden_states=student_hidden_states,
+                teacher_hidden_states=teacher_hidden_states,
+            )
+            loss = loss + self.hidden_distill_weight * hidden_distill_loss
 
         if return_outputs:
             student_outputs.loss = loss
@@ -855,6 +1079,10 @@ def main() -> None:
             distill_weight=args.distill_weight,
             ce_weight=args.ce_weight,
             temperature=args.distill_temperature,
+            beacon_attn_weight=args.beacon_attn_weight,
+            hidden_distill_weight=args.hidden_distill_weight,
+            hidden_distill_layer=args.hidden_distill_layer,
+            min_beacon_attn=args.min_beacon_attn,
         )
 
         if args.resume_from_checkpoint is not None:

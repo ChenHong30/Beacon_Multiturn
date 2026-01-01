@@ -12,7 +12,7 @@ cd "$SCRIPT_DIR"
 MODEL_PATH="/data/hkustgz/model_weight/Qwen3-0.6B/"
 TEACHER_MODEL_PATH="/data/hkustgz/model_weight/Qwen3-0.6B/"
 DATA_PATHS="dataset_multiturn_generated.jsonl"
-OUTPUT_DIR="/data/hkustgz/model_weight/8_beacon_4_sink_distill_generated"
+OUTPUT_DIR="/data/hkustgz/model_weight/8_beacon_0_sink_distill_v2"
 PROCESSED_CACHE_DIR="./runs/dataset_cache_generated"
 MAX_LENGTH="4096"
 BATCH_SIZE="1"
@@ -22,11 +22,17 @@ NUM_EPOCHS="16"
 WARMUP_RATIO="0.03"
 SAVE_STEPS="500"
 NUM_BEACONS="8"
-NUM_SINKS="4"
+NUM_SINKS="0"
 BEACON_RECON_WEIGHT="1.0"
 DISTILL_WEIGHT="1.0"
 CE_WEIGHT="0.0"
-DISTILL_TEMP="1.0"
+DISTILL_TEMP="2.0"
+# 新增参数
+BEACON_ATTN_WEIGHT="0.5"
+MIN_BEACON_ATTN="0.5"
+HIDDEN_DISTILL_WEIGHT="0.5"
+HIDDEN_DISTILL_LAYER="-1"
+
 
 if [ -z "$CUDA_VISIBLE_DEVICES" ]; then
     N_GPUS=$(nvidia-smi -L | wc -l)
@@ -35,7 +41,7 @@ else
 fi
 
 echo "========================================"
-echo "Beacon Distillation Training"
+echo "Beacon Distillation Training (v2)"
 echo "========================================"
 echo "Number of GPUs: $N_GPUS"
 echo "Student model path: $MODEL_PATH"
@@ -55,6 +61,10 @@ echo "Beacon recon weight: $BEACON_RECON_WEIGHT"
 echo "Distill weight: $DISTILL_WEIGHT"
 echo "CE weight: $CE_WEIGHT"
 echo "Distill temperature: $DISTILL_TEMP"
+echo "Beacon attn weight: $BEACON_ATTN_WEIGHT"
+echo "Hidden distill weight: $HIDDEN_DISTILL_WEIGHT"
+echo "Hidden distill layer: $HIDDEN_DISTILL_LAYER"
+echo "Min beacon attn: $MIN_BEACON_ATTN"
 echo "========================================"
 
 if [ "$N_GPUS" -gt 1 ]; then
@@ -81,6 +91,10 @@ if [ "$N_GPUS" -gt 1 ]; then
         --distill-weight $DISTILL_WEIGHT \
         --ce-weight $CE_WEIGHT \
         --distill-temperature $DISTILL_TEMP \
+        --beacon-attn-weight $BEACON_ATTN_WEIGHT \
+        --hidden-distill-weight $HIDDEN_DISTILL_WEIGHT \
+        --hidden-distill-layer $HIDDEN_DISTILL_LAYER \
+        --min-beacon-attn $MIN_BEACON_ATTN \
         --bf16 \
         --train-beacon-only \
         --gradient-checkpointing \
@@ -106,6 +120,10 @@ else
         --distill-weight $DISTILL_WEIGHT \
         --ce-weight $CE_WEIGHT \
         --distill-temperature $DISTILL_TEMP \
+        --beacon-attn-weight $BEACON_ATTN_WEIGHT \
+        --hidden-distill-weight $HIDDEN_DISTILL_WEIGHT \
+        --hidden-distill-layer $HIDDEN_DISTILL_LAYER \
+        --min-beacon-attn $MIN_BEACON_ATTN \
         --bf16 \
         --train-beacon-only \
         --train-lm-head \
