@@ -631,6 +631,14 @@ class Qwen3Model(Qwen3PreTrainedModel):
             torch.zeros(self.num_beacons_per_segment, config.hidden_size)
         )
 
+        # === Beacon 轮次编码 (Turn Encoding) ===
+        # 每个轮次有独立的可学习 embedding，帮助模型区分不同轮次的历史信息
+        # 最多支持 max_turns 个轮次
+        self.max_turns = getattr(config, 'max_beacon_turns', 16)  # 默认最多支持16轮历史
+        self.beacon_turn_embedding = nn.Parameter(
+            torch.zeros(self.max_turns, config.hidden_size)
+        )
+
         # 用于记录压缩后的 KV cache 长度，供生成阶段使用
         self._compressed_seq_length = None
         # 用于记录压缩前的原始序列长度，供生成阶段计算 position_ids
@@ -681,6 +689,11 @@ class Qwen3Model(Qwen3PreTrainedModel):
             # 初始化 beacon position embedding（使用小的随机值）
             # 这让每个 beacon 位置有独特的初始化，帮助模型学习分工
             nn.init.normal_(self.beacon_position_embedding, mean=0.0, std=0.02)
+            
+            # 初始化 beacon turn embedding（使用小的随机值）
+            # 这让模型能区分不同轮次的历史信息
+            nn.init.normal_(self.beacon_turn_embedding, mean=0.0, std=0.02)
+            print(f"\033[93m[Beacon Init] Initialized turn embedding for {self.max_turns} turns\033[0m")
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -690,7 +703,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
     def parse_multiturn_dialogue(
         self, input_ids: torch.Tensor, labels: Optional[torch.Tensor] = None
-    ) -> tuple[list, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    ) -> tuple[list, torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
         """
         解析多轮对话序列，识别每个QA轮次，并在每个历史轮次末尾添加beacon token
 
@@ -709,11 +722,13 @@ class Qwen3Model(Qwen3PreTrainedModel):
             modified_input_ids: 添加了beacon token的input_ids
             beacon_positions: beacon token的位置mask
             modified_labels: 若提供labels，则返回与modified_input_ids对齐的labels（beacon位置填充为-100）
+            beacon_turn_ids: 每个位置对应的轮次ID（非beacon位置为-1）
         """
         batch_size, seq_len = input_ids.shape
         qa_segments = []
         modified_input_ids_list = []
         beacon_positions_list = []
+        beacon_turn_ids_list = []  # 新增：记录每个beacon的轮次ID
         modified_labels_list = [] if labels is not None else None
         pad_token_id = self.config.pad_token_id
         if pad_token_id is None:
@@ -727,6 +742,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
             segments = []
             modified_ids = []
             beacon_pos = []
+            beacon_turns = []  # 新增：记录每个位置的轮次ID
             modified_label_ids = [] if labels is not None else None
 
             # 查找所有的<|im_start|>和<|im_end|>位置
@@ -779,10 +795,19 @@ class Qwen3Model(Qwen3PreTrainedModel):
             if len(history_messages) == 0:
                 modified_input_ids_list.append(ids)
                 beacon_positions_list.append([0] * len(ids))
+                beacon_turn_ids_list.append([-1] * len(ids))  # 没有beacon，全部填-1
                 qa_segments.append([])
                 if labels is not None and modified_labels_list is not None:
                     modified_labels_list.append(label_row)
                 continue
+
+            # 计算每个历史消息属于第几个轮次（用于轮次编码）
+            # 轮次定义：每个user+assistant对为一个轮次
+            turn_counter = 0
+            message_to_turn = {}  # 消息索引 -> 轮次ID
+            for msg_idx in history_messages:
+                message_to_turn[msg_idx] = turn_counter // 2  # user和assistant共享同一个轮次ID
+                turn_counter += 1
 
             current_pos = 0
             for i, (start_pos, end_pos) in enumerate(pairs):
@@ -795,16 +820,23 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 segment_tokens = ids[current_pos:end_pos + 1]
                 modified_ids.extend(segment_tokens)
                 beacon_pos.extend([0] * len(segment_tokens))
+                beacon_turns.extend([-1] * len(segment_tokens))  # 非beacon位置填-1
                 if labels is not None and modified_label_ids is not None:
                     segment_labels = label_row[current_pos:end_pos + 1]
                     modified_label_ids.extend(segment_labels)
 
                 # 只在历史消息（非system，且在最后一个user之前）后添加beacon
                 if i in history_messages:
+                    # 获取当前消息的轮次ID
+                    current_turn_id = message_to_turn.get(i, 0)
+                    # 限制轮次ID不超过max_turns
+                    current_turn_id = min(current_turn_id, self.max_turns - 1)
+                    
                     # Insert beacon tokens (数量由 config 指定)
                     for beacon_idx in range(self.num_beacons_per_segment):
                         modified_ids.append(self.beacon_token_id)
                         beacon_pos.append(1)  # 标记这是beacon token位置
+                        beacon_turns.append(current_turn_id)  # 记录轮次ID
                         if labels is not None and modified_label_ids is not None:
                             # 最后一个beacon预测下一个token（通常是<|im_start|>）
                             # 其他beacon位置不参与loss
@@ -829,12 +861,14 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 remaining_tokens = ids[current_pos:]
                 modified_ids.extend(remaining_tokens)
                 beacon_pos.extend([0] * len(remaining_tokens))
+                beacon_turns.extend([-1] * len(remaining_tokens))  # 非beacon位置填-1
                 if labels is not None and modified_label_ids is not None:
                     remaining_labels = label_row[current_pos:]
                     modified_label_ids.extend(remaining_labels)
 
             modified_input_ids_list.append(modified_ids)
             beacon_positions_list.append(beacon_pos)
+            beacon_turn_ids_list.append(beacon_turns)  # 新增
             qa_segments.append(segments)
             if labels is not None and modified_labels_list is not None:
                 modified_labels_list.append(modified_label_ids)
@@ -844,16 +878,19 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
         padded_input_ids = []
         padded_beacon_pos = []
+        padded_beacon_turns = []  # 新增
         padded_labels = [] if modified_labels_list is not None else None
 
-        for index, (ids, beacon_pos) in enumerate(zip(modified_input_ids_list, beacon_positions_list)):
+        for index, (ids, beacon_pos, beacon_turns) in enumerate(zip(modified_input_ids_list, beacon_positions_list, beacon_turn_ids_list)):
             # padding
             pad_len = max_len - len(ids)
             padded_ids = ids + [pad_token_id] * pad_len
             padded_pos = beacon_pos + [0] * pad_len
+            padded_turns = beacon_turns + [-1] * pad_len  # padding位置填-1
 
             padded_input_ids.append(padded_ids)
             padded_beacon_pos.append(padded_pos)
+            padded_beacon_turns.append(padded_turns)
 
             if padded_labels is not None and modified_labels_list is not None:
                 label_ids = modified_labels_list[index]
@@ -862,6 +899,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
         modified_input_ids = torch.tensor(padded_input_ids, dtype=input_ids.dtype, device=input_ids.device)
         beacon_positions = torch.tensor(padded_beacon_pos, dtype=torch.bool, device=input_ids.device)
+        beacon_turn_ids = torch.tensor(padded_beacon_turns, dtype=torch.long, device=input_ids.device)  # 新增
         modified_labels_tensor = None
         if padded_labels is not None:
             modified_labels_tensor = torch.tensor(padded_labels, dtype=labels.dtype, device=labels.device)
@@ -879,7 +917,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
         #     if beacon_indices.numel() > 0:
         #         print(f"\033[95m[DEBUG parse_multiturn] Beacon positions in modified seq: {beacon_indices.tolist()}\033[0m")
 
-        return qa_segments, modified_input_ids, beacon_positions, modified_labels_tensor
+        return qa_segments, modified_input_ids, beacon_positions, modified_labels_tensor, beacon_turn_ids
 
     def compress_kv_cache(
         self, past_key_values: Cache, beacon_positions: torch.Tensor, qa_segments: list = None
@@ -1090,9 +1128,10 @@ class Qwen3Model(Qwen3PreTrainedModel):
                       (hasattr(past_key_values, 'get_seq_length') and past_key_values.get_seq_length() == 0))
 
         # 只在预填充阶段进行beacon压缩
+        beacon_turn_ids = None  # 初始化轮次ID
         if (input_ids is not None and enable_beacon_compression and is_prefill):
             # 解析多轮对话并添加beacon token
-            qa_segments, modified_input_ids, beacon_positions, modified_labels = self.parse_multiturn_dialogue(
+            qa_segments, modified_input_ids, beacon_positions, modified_labels, beacon_turn_ids = self.parse_multiturn_dialogue(
                 input_ids, labels
             )
 
@@ -1123,9 +1162,10 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
                 inputs_embeds = inputs_embeds.clone()
 
-                # === Beacons 增强：为每个 beacon 添加独特的 position embedding ===
-                # beacon_embedding 是共享的基础 embedding
-                # beacon_position_embedding 根据 beacon 在 segment 内的位置添加
+                # === Beacons 增强：为每个 beacon 添加 position embedding + turn embedding ===
+                # beacon_embedding: 共享的基础 embedding
+                # beacon_position_embedding: 每个 beacon 在 segment 内的位置编码
+                # beacon_turn_embedding: 每个 beacon 所属轮次的编码
                 batch_size, seq_len = input_ids.shape
                 for b in range(batch_size):
                     beacon_indices = torch.nonzero(beacon_mask[b], as_tuple=False).squeeze(-1)
@@ -1133,8 +1173,19 @@ class Qwen3Model(Qwen3PreTrainedModel):
                         # 每 num_beacons_per_segment 个 beacons 为一组（对应一个 segment）
                         for i, idx in enumerate(beacon_indices.tolist()):
                             pos_in_segment = i % self.num_beacons_per_segment
-                            # 基础 embedding + 位置 embedding
-                            inputs_embeds[b, idx] = self.beacon_embedding + self.beacon_position_embedding[pos_in_segment]
+                            # 获取轮次ID（如果可用）
+                            if beacon_turn_ids is not None:
+                                turn_id = beacon_turn_ids[b, idx].item()
+                                turn_id = max(0, min(turn_id, self.max_turns - 1))  # 确保在有效范围内
+                            else:
+                                # 后备方案：根据beacon组计算轮次
+                                turn_id = min(i // self.num_beacons_per_segment, self.max_turns - 1)
+                            # 基础 embedding + 位置 embedding + 轮次 embedding
+                            inputs_embeds[b, idx] = (
+                                self.beacon_embedding + 
+                                self.beacon_position_embedding[pos_in_segment] +
+                                self.beacon_turn_embedding[turn_id]
+                            )
             else:
                 inputs_embeds = self.embed_tokens(input_ids)
                 
@@ -1142,7 +1193,8 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 if self.training and self.beacon_embedding.requires_grad:
                      dummy_beacon_emb = (
                          self.beacon_embedding.sum() + 
-                         self.beacon_position_embedding.sum()
+                         self.beacon_position_embedding.sum() +
+                         self.beacon_turn_embedding.sum()  # 添加轮次编码
                      ) * 0.0
                      inputs_embeds = inputs_embeds + dummy_beacon_emb
 
@@ -1584,6 +1636,11 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
 
         # 转换 beacon_position_embedding 的数据类型
         model.model.beacon_position_embedding.data = model.model.beacon_position_embedding.data.to(
+            dtype=target_dtype, device=target_device
+        )
+
+        # 转换 beacon_turn_embedding 的数据类型
+        model.model.beacon_turn_embedding.data = model.model.beacon_turn_embedding.data.to(
             dtype=target_dtype, device=target_device
         )
 

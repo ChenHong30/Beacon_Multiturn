@@ -586,7 +586,7 @@ class DistillTrainer(Trainer):
         student_seq_len: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         with torch.no_grad():
-            _, modified_input_ids, _, _ = student_model.model.parse_multiturn_dialogue(input_ids, labels)
+            _, modified_input_ids, _, _, _ = student_model.model.parse_multiturn_dialogue(input_ids, labels)
 
         if modified_input_ids.shape[1] != student_seq_len:
             modified_input_ids = modified_input_ids[:, :student_seq_len]
@@ -687,7 +687,7 @@ class DistillTrainer(Trainer):
 
         # 解析对话结构，获取beacon位置和当前轮次位置
         with torch.no_grad():
-            segment_bounds, modified_input_ids, _, _ = student_model.model.parse_multiturn_dialogue(
+            segment_bounds, modified_input_ids, _, _, _ = student_model.model.parse_multiturn_dialogue(
                 input_ids, labels
             )
 
@@ -776,7 +776,7 @@ class DistillTrainer(Trainer):
 
         # 解析对话结构，建立学生到教师的位置映射
         with torch.no_grad():
-            segment_bounds, modified_input_ids, _, _ = student_model.model.parse_multiturn_dialogue(
+            segment_bounds, modified_input_ids, _, _, _ = student_model.model.parse_multiturn_dialogue(
                 input_ids, labels
             )
 
