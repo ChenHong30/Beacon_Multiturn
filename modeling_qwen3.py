@@ -1103,6 +1103,11 @@ class Qwen3Model(Qwen3PreTrainedModel):
         enable_beacon_compression: Optional[bool] = True,
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithPast:
+        r"""
+        Args:
+            enable_beacon_compression (`bool`, *optional*, defaults to `True`):
+                Whether or not to enable beacon compression.
+        """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states

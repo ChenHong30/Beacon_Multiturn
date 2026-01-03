@@ -1,17 +1,15 @@
 import sys
 import os
-import re
 import json
 import multiprocessing as mp
 import time
 from datetime import datetime
-from collections import defaultdict
-from typing import Any, List, Dict, Optional, Tuple
+from typing import Any, List, Dict, Optional
 
 # 导入 transformers pipeline
 import torch
 from datasets import load_dataset
-from transformers import AutoConfig, AutoTokenizer, pipeline # 导入 pipeline
+from transformers import AutoTokenizer
 
 from tqdm.auto import tqdm
 
@@ -45,118 +43,12 @@ except ImportError:
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 sys.path.insert(0, PROJECT_ROOT)
 
+from eval import common, modeling
+from eval.multi_if import multi_if_utils
 
 # ============================================================
-# 1. Pipeline Setup (取代 load_standard_model)
+# 1. Worker Helpers
 # ============================================================
-def create_generation_pipeline(model_path: str, device_id: int = 0):
-    """
-    创建 Hugging Face text-generation pipeline.
-    """
-    print(f"Creating generation pipeline for: {model_path}")
-
-    if torch.cuda.is_available():
-        torch.cuda.set_device(device_id)
-
-    # 确定设备 ID: 如果有 CUDA 则使用指定的 GPU ID，否则使用 CPU (-1)
-    pipe_device = device_id if torch.cuda.is_available() else -1
-
-    # 加载 Tokenizer (需要它来格式化 Chat Template)
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_path,
-        trust_remote_code=True,
-    )
-
-    # 创建 text-generation pipeline
-    pipe = pipeline(
-        "text-generation",
-        model=model_path,
-        tokenizer=tokenizer,
-        # 确保 dtype 正确，以节省 GPU 内存
-        dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-        device=pipe_device,
-        model_kwargs={
-            "attn_implementation": "eager",
-        }
-    )
-
-    print(f"Pipeline created. Model loaded on {pipe.device} (tokenizer available)")
-    # 返回 pipeline 对象、tokenizer（用于 chat template）和设备信息
-    return pipe, tokenizer, pipe.device
-
-def write_json_atomic(path: str, data: Dict[str, Any]) -> None:
-    """原子性地写入 JSON 文件，防止写入失败导致文件损坏。"""
-    tmp_path = f"{path}.tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-    os.replace(tmp_path, path)
-
-
-def _parse_cuda_ids(cuda_id: Any, cuda_ids: Optional[Any]) -> List[int]:
-    """
-    Parse GPU ids from either `cuda_ids` (preferred) or `cuda_id` (backward compatible).
-
-    Notes:
-      - `python-fire` may parse values like "0,1,2,3" into a tuple (0, 1, 2, 3).
-      - We accept list/tuple/int/str for both params.
-    """
-    source = cuda_ids if cuda_ids is not None else cuda_id
-    if source is None:
-        return [0]
-
-    if isinstance(source, (list, tuple)):
-        ids = [int(x) for x in source]
-    elif isinstance(source, str):
-        s = source.strip()
-        if not s:
-            ids = [0]
-        else:
-            # accept e.g. "0,1,2,3" or "[0,1,2,3]"
-            if s.startswith("[") and s.endswith("]"):
-                try:
-                    parsed = json.loads(s)
-                    if isinstance(parsed, list):
-                        ids = [int(x) for x in parsed]
-                    else:
-                        ids = [0]
-                except Exception:
-                    ids = [int(x) for x in re.split(r"[,\s]+", s) if x]
-            else:
-                ids = [int(x) for x in re.split(r"[,\s]+", s) if x]
-    else:
-        ids = [int(source)]
-
-    # de-dup but keep order
-    ids = list(dict.fromkeys(ids))
-    return ids
-
-
-def _validate_cuda_ids(cuda_ids: List[int]) -> None:
-    if not torch.cuda.is_available():
-        if cuda_ids and cuda_ids != [0]:
-            print(f"[WARN] CUDA not available; falling back to CPU (cuda_ids={cuda_ids}).")
-        return
-
-    device_count = torch.cuda.device_count()
-    for cid in cuda_ids:
-        if cid < 0 or cid >= device_count:
-            raise ValueError(
-                f"Invalid cuda_id={cid}; torch.cuda.device_count()={device_count}."
-            )
-
-
-def _get_english_indices_by_split(ds) -> Tuple[List[str], Dict[str, List[int]]]:
-    split_names = list(ds.keys())
-    english_indices_by_split: Dict[str, List[int]] = {}
-    for split in split_names:
-        langs = ds[split]["language"]
-        english_indices_by_split[split] = [
-            i for i, lang in enumerate(langs)
-            if str(lang or "").lower() == "english"
-        ]
-    return split_names, english_indices_by_split
-
-
 def _worker_output_path(log_dir: str, timestamp: str, run_tag: str, worker_id: int) -> str:
     return os.path.join(
         log_dir, f"multi_if_pipeline_{timestamp}_{run_tag}.worker{worker_id}.json"
@@ -178,11 +70,15 @@ def _run_worker(
     flush_every: int,
     progress_counter: Optional[Any],
 ) -> None:
+    if num_workers > 1:
+        common.configure_process_logging(rank=worker_id, force_non_main=True)
+
     worker_out = _worker_output_path(log_dir, timestamp, run_tag, worker_id)
 
-    pipe, tokenizer, device = create_generation_pipeline(
+    pipe, tokenizer, device = modeling.create_generation_pipeline(
         model_path=model_path,
         device_id=cuda_id,
+        log=True,
     )
     ds = load_dataset("facebook/Multi-IF")
 
@@ -207,7 +103,7 @@ def _run_worker(
             "errors": errors,
         }
         try:
-            write_json_atomic(worker_out, output)
+            common.write_json_atomic(worker_out, output)
         except Exception as e:
             print(f"[WARN] Failed to write {worker_out}: {e}")
 
@@ -269,39 +165,7 @@ def _run_worker(
 
 
 # ============================================================
-# 2. Extract turns from Multi-IF sample (无变化)
-# ============================================================
-def extract_turns_from_multi_if(sample: Dict) -> List[Dict[str, str]]:
-    """
-    从原始 Multi-IF 样本中提取按顺序排列的对话回合。
-    """
-    turns = []
-
-    pattern = re.compile(r"turn_(\d+)_prompt")
-    indexed_prompts = []
-
-    for k, v in sample.items():
-        if v is None:
-            continue
-        m = pattern.fullmatch(k)
-        if m:
-            idx = int(m.group(1))
-            indexed_prompts.append((idx, v))
-
-    indexed_prompts.sort(key=lambda x: x[0])
-
-    for idx, prompt_str in indexed_prompts:
-        try:
-            msg = json.loads(prompt_str)
-            turns.append(msg)  # {"role": "user", "content": "..."}
-        except json.JSONDecodeError as e:
-            print(f"[WARN] turn_{idx}_prompt JSON decode failed: {e}")
-
-    return turns
-
-
-# ============================================================
-# 3. Run one Multi-IF sample (ALL turns) - 使用 Pipeline
+# 2. Run one Multi-IF sample (ALL turns) - 使用 Pipeline
 # ============================================================
 def run_multi_if_sample(
     sample: Dict,
@@ -321,7 +185,7 @@ def run_multi_if_sample(
         }
     ]
 
-    turns = extract_turns_from_multi_if(sample)
+    turns = multi_if_utils.extract_turns_from_multi_if(sample)
     if verbose:
         print(f"Total turns: {len(turns)}")
 
@@ -349,21 +213,15 @@ def run_multi_if_sample(
         # 2. 调用 pipeline 进行生成
         # pipeline 负责编码字符串、调用模型生成和解码结果
         try:
-            output = pipe(
+            resp = modeling.generate_text_with_pipeline(
+                pipe,
+                tokenizer,
                 prompt_text,
                 max_new_tokens=2048,
                 temperature=0.7,
                 do_sample=True,
-                pad_token_id=tokenizer.eos_token_id,
-                use_cache=True,
-                
-                # Pipeline 特有的参数
-                return_full_text=False, # 确保只返回新生成的文本
-                clean_up_tokenization_spaces=True,
+                top_p=None,
             )
-            
-            # 提取生成的文本
-            resp = output[0]['generated_text'].strip()
             
         except Exception as e:
             resp = f"[ERROR_GENERATION] {repr(e)}"
@@ -378,109 +236,6 @@ def run_multi_if_sample(
         generated_responses.append(resp)
 
     return generated_responses
-
-
-# ============================================================
-# 4. Metrics aggregation (无变化)
-# ============================================================
-def _safe_div(num: int, den: int) -> float:
-    return float(num) / float(den) if den else 0.0
-
-
-def compute_multi_if_metrics(eval_results: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    聚合所有评估结果，计算不同粒度的指标。
-    """
-    total_samples = 0
-    total_turns = 0
-    total_instructions = 0
-
-    strict_turn_pass = 0
-    loose_turn_pass = 0
-
-    strict_instruction_pass = 0
-    loose_instruction_pass = 0
-
-    strict_conv_pass = 0
-    loose_conv_pass = 0
-
-    by_instruction: Dict[str, Dict[str, int]] = defaultdict(
-        lambda: {"total": 0, "strict_pass": 0, "loose_pass": 0}
-    )
-
-    for sample_res in eval_results:
-        turns = sample_res.get("turns") or []
-        if not turns:
-            continue
-
-        total_samples += 1
-        conv_strict_ok = True
-        conv_loose_ok = True
-
-        for turn in turns:
-            # 确保这些键存在且是列表
-            follow_strict = turn.get("follow_strict") or []
-            follow_loose = turn.get("follow_loose") or []
-            instruction_ids = turn.get("instruction_id_list") or []
-
-            total_turns += 1
-
-            # 回合通过：该回合中所有指令都通过
-            strict_ok = bool(follow_strict) and all(bool(x) for x in follow_strict)
-            loose_ok = bool(follow_loose) and all(bool(x) for x in follow_loose)
-
-            strict_turn_pass += int(strict_ok)
-            loose_turn_pass += int(loose_ok)
-
-            # 对话通过：该对话中所有回合都必须通过
-            conv_strict_ok = conv_strict_ok and strict_ok
-            conv_loose_ok = conv_loose_ok and loose_ok
-
-            # 统计指令级通过数
-            total_instructions += len(follow_strict)
-            strict_instruction_pass += sum(int(bool(x)) for x in follow_strict)
-            loose_instruction_pass += sum(int(bool(x)) for x in follow_loose)
-
-            # 统计按指令 ID 分类的指标
-            for instruction_id, fs, fl in zip(instruction_ids, follow_strict, follow_loose):
-                rec = by_instruction[str(instruction_id)]
-                rec["total"] += 1
-                rec["strict_pass"] += int(bool(fs))
-                rec["loose_pass"] += int(bool(fl))
-
-        strict_conv_pass += int(conv_strict_ok)
-        loose_conv_pass += int(conv_loose_ok)
-
-    # 计算指令级准确率
-    by_instruction_acc = {
-        k: {
-            "total": v["total"],
-            "strict_acc": _safe_div(v["strict_pass"], v["total"]),
-            "loose_acc": _safe_div(v["loose_pass"], v["total"]),
-        }
-        for k, v in sorted(by_instruction.items(), key=lambda kv: kv[0])
-    }
-
-    return {
-        "counts": {
-            "samples": total_samples,
-            "turns": total_turns,
-            "instructions": total_instructions,
-        },
-        "turn_level": {
-            "strict_acc": _safe_div(strict_turn_pass, total_turns),
-            "loose_acc": _safe_div(loose_turn_pass, total_turns),
-        },
-        "instruction_level": {
-            "strict_acc": _safe_div(strict_instruction_pass, total_instructions),
-            "loose_acc": _safe_div(loose_instruction_pass, total_instructions),
-        },
-        "conversation_level": {
-            "strict_acc": _safe_div(strict_conv_pass, total_samples),
-            "loose_acc": _safe_div(loose_conv_pass, total_samples),
-        },
-        "by_instruction_id": by_instruction_acc,
-    }
 
 
 # ============================================================
@@ -500,11 +255,11 @@ def main(
     run_tag = "base"
     output_path = os.path.join(resolved_log_dir, f"multi_if_pipeline_{timestamp}_{run_tag}.json")
 
-    cuda_id_list = _parse_cuda_ids(cuda_id=cuda_id, cuda_ids=cuda_ids)
-    _validate_cuda_ids(cuda_id_list)
+    cuda_id_list = common.parse_cuda_ids(cuda_id=cuda_id, cuda_ids=cuda_ids)
+    common.validate_cuda_ids(cuda_id_list)
 
     ds = load_dataset("facebook/Multi-IF")
-    split_names, english_indices_by_split = _get_english_indices_by_split(ds)
+    split_names, english_indices_by_split = multi_if_utils.get_english_indices_by_split(ds)
     total_english = sum(len(v) for v in english_indices_by_split.values())
 
     # ============================================================
@@ -604,7 +359,7 @@ def main(
         all_eval_results.sort(key=lambda r: r.get("global_index", 0))
         errors.sort(key=lambda r: r.get("global_index", 0))
 
-        metrics = compute_multi_if_metrics(all_eval_results)
+        metrics = multi_if_utils.compute_multi_if_metrics(all_eval_results)
         output = {
             "meta": {
                 "timestamp": timestamp,
@@ -626,7 +381,7 @@ def main(
             "results": all_eval_results,
             "errors": errors,
         }
-        write_json_atomic(output_path, output)
+        common.write_json_atomic(output_path, output)
 
         print("\n=== MULTI-IF (PIPELINE) METRICS ===")
         print(json.dumps(metrics, indent=2, ensure_ascii=False))
@@ -641,9 +396,10 @@ def main(
     # ============================================================
     # Single GPU / CPU: keep serial evaluation
     # ============================================================
-    pipe, tokenizer, device = create_generation_pipeline(
+    pipe, tokenizer, device = modeling.create_generation_pipeline(
         model_path,
         int(cuda_id_list[0]) if cuda_id_list else cuda_id,
+        log=True,
     )
 
     all_eval_results: List[Dict[str, Any]] = []
@@ -651,7 +407,7 @@ def main(
 
     def flush() -> None:
         """计算当前指标并保存到磁盘。"""
-        metrics = compute_multi_if_metrics(all_eval_results)
+        metrics = multi_if_utils.compute_multi_if_metrics(all_eval_results)
         output = {
             "meta": {
                 "timestamp": timestamp,
@@ -671,7 +427,7 @@ def main(
             "errors": errors,
         }
         try:
-            write_json_atomic(output_path, output)
+            common.write_json_atomic(output_path, output)
         except Exception as e:
             print(f"[WARN] Failed to write {output_path}: {e}")
 
@@ -728,7 +484,7 @@ def main(
         pbar.close()
 
     flush()
-    metrics = compute_multi_if_metrics(all_eval_results)
+    metrics = multi_if_utils.compute_multi_if_metrics(all_eval_results)
     print("\n=== MULTI-IF (PIPELINE) METRICS ===")
     print(json.dumps(metrics, indent=2, ensure_ascii=False))
     print(f"\nSaved to: {output_path}")

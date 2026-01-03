@@ -8,36 +8,13 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import torch
-from transformers import AutoTokenizer, pipeline
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-import eval_mtbench_101_beacon as beacon
-
-
-def create_generation_pipeline(model_path: str, device_id: int = 0):
-    if torch.cuda.is_available():
-        torch.cuda.set_device(device_id)
-
-    pipe_device = device_id if torch.cuda.is_available() else -1
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_path,
-        trust_remote_code=True,
-        fix_mistral_regex=True,
-    )
-    pipe = pipeline(
-        "text-generation",
-        model=model_path,
-        tokenizer=tokenizer,
-        dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-        device=pipe_device,
-        model_kwargs={
-            "attn_implementation": "eager",
-        },
-    )
-    return pipe, tokenizer
+from eval import common, modeling
+from eval.mtbench_101 import mtbench_101_utils as mtbench_utils
 
 
 def generate_response(
@@ -55,20 +32,15 @@ def generate_response(
         add_generation_prompt=True,
         enable_thinking=False,
     )
-    gen_kwargs: Dict[str, Any] = {
-        "max_new_tokens": max_new_tokens,
-        "temperature": temperature,
-        "do_sample": do_sample,
-        "pad_token_id": tokenizer.eos_token_id,
-        "use_cache": True,
-        "return_full_text": False,
-        "clean_up_tokenization_spaces": True,
-    }
-    if top_p is not None:
-        gen_kwargs["top_p"] = top_p
-
-    output = pipe(prompt_text, **gen_kwargs)
-    return output[0]["generated_text"].strip()
+    return modeling.generate_text_with_pipeline(
+        pipe,
+        tokenizer,
+        prompt_text,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        do_sample=do_sample,
+        top_p=top_p,
+    )
 
 
 def _evaluate_dialogue(
@@ -76,7 +48,7 @@ def _evaluate_dialogue(
     dialogue_index: Optional[int],
     pipe,
     tokenizer,
-    judge_client: beacon.OpenAICompatClient,
+    judge_client: mtbench_utils.OpenAICompatClient,
     max_new_tokens: int,
     temperature: float,
     do_sample: bool,
@@ -85,7 +57,7 @@ def _evaluate_dialogue(
     task = dialogue.get("task", "")
     multi_id = dialogue.get("id", None)
     turns = dialogue.get("history") or []
-    skip_first = task in beacon.skip_first_tasks
+    skip_first = task in mtbench_utils.skip_first_tasks
 
     results: List[Dict[str, Any]] = []
     for turn_index, turn in enumerate(turns):
@@ -97,10 +69,10 @@ def _evaluate_dialogue(
         if system_prompt:
             dialogue_messages.append({"role": "system", "content": str(system_prompt)})
         for i in range(turn_index + 1):
-            user = beacon._get_turn_user(turns[i])
+            user = mtbench_utils.get_turn_user(turns[i])
             dialogue_messages.append({"role": "user", "content": user})
             if i < turn_index:
-                bot = beacon._get_turn_bot(turns[i])
+                bot = mtbench_utils.get_turn_bot(turns[i])
                 if bot:
                     dialogue_messages.append({"role": "assistant", "content": bot})
 
@@ -114,9 +86,15 @@ def _evaluate_dialogue(
             top_p=top_p,
         )
 
-        history_str = beacon._build_history_str(turns, turn_index)
-        ref_answer = beacon._extract_reference(dialogue, turn, turn_index) if task in beacon.need_ref_tasks else ""
-        system_prompt, prompt_template = beacon.eval_prompt_construct(task, ref_answer, history_str)
+        history_str = mtbench_utils.build_history_str(turns, turn_index)
+        ref_answer = (
+            mtbench_utils.extract_reference(dialogue, turn, turn_index)
+            if task in mtbench_utils.need_ref_tasks
+            else ""
+        )
+        system_prompt, prompt_template = mtbench_utils.eval_prompt_construct(
+            task, ref_answer, history_str
+        )
         prompt = prompt_template.format(prediction=pred)
 
         judge_text = judge_client.chat(
@@ -125,7 +103,7 @@ def _evaluate_dialogue(
                 {"role": "user", "content": prompt},
             ]
         )
-        judged = beacon.post_process_mtbench101({"prediction": judge_text})
+        judged = mtbench_utils.post_process_mtbench101({"prediction": judge_text})
         score = judged["score"] if judged else None
 
         results.append(
@@ -171,13 +149,18 @@ def _run_worker(
     flush_every: int,
     progress_counter: Optional[Any],
 ) -> None:
+    if num_workers > 1:
+        common.configure_process_logging(rank=worker_id, force_non_main=True)
+
     worker_out = _worker_output_path(log_dir, timestamp, run_tag, worker_id)
 
-    pipe, tokenizer = create_generation_pipeline(
+    pipe, tokenizer, _device = modeling.create_generation_pipeline(
         model_path=model_path,
         device_id=cuda_id,
+        fix_mistral_regex=True,
+        log=False,
     )
-    judge_client = beacon.OpenAICompatClient(
+    judge_client = mtbench_utils.OpenAICompatClient(
         base_url=api_config["openai_base_url"],
         api_key=api_config["openai_api_key"],
         model=api_config["judge_model"],
@@ -211,7 +194,7 @@ def _run_worker(
             "errors": errors,
         }
         try:
-            beacon.write_json_atomic(worker_out, output)
+            common.write_json_atomic(worker_out, output)
         except Exception as e:
             print(f"[WARN] Failed to write {worker_out}: {e}")
 
@@ -284,17 +267,17 @@ def main(
     api_config_path = config_path or os.path.join(
         PROJECT_ROOT, "eval", "mtbench_101", "mtbench_101_config.json"
     )
-    api_config = beacon._load_api_config(api_config_path)
+    api_config = mtbench_utils.load_api_config(api_config_path)
 
     run_tag = "base"
     output_path = os.path.join(
         resolved_log_dir, f"mtbench_101_base_{timestamp}_{run_tag}.json"
     )
 
-    conversations = beacon._load_mtbench101(data_path, name=name)
+    conversations = mtbench_utils.load_mtbench101(data_path, name=name)
 
-    cuda_id_list = beacon._parse_cuda_ids(cuda_id=cuda_id, cuda_ids=cuda_ids)
-    beacon._validate_cuda_ids(cuda_id_list)
+    cuda_id_list = common.parse_cuda_ids(cuda_id=cuda_id, cuda_ids=cuda_ids)
+    common.validate_cuda_ids(cuda_id_list)
 
     use_multi = torch.cuda.is_available() and len(cuda_id_list) > 1
 
@@ -385,7 +368,9 @@ def main(
 
         judged_answers = [{"score": r.get("score")} for r in all_results if r.get("score") is not None]
         references = [r.get("judge") for r in all_results if r.get("score") is not None]
-        results = beacon.get_final_results(judged_answers, references) if judged_answers else {}
+        results = (
+            mtbench_utils.get_final_results(judged_answers, references) if judged_answers else {}
+        )
 
         output = {
             "meta": {
@@ -406,7 +391,7 @@ def main(
             "results": all_results,
             "errors": errors,
         }
-        beacon.write_json_atomic(output_path, output)
+        common.write_json_atomic(output_path, output)
 
         print("\n=== MTBench_101 METRICS ===")
         print(json.dumps(results, indent=2, ensure_ascii=False))
@@ -418,11 +403,13 @@ def main(
             )
         return output_path
 
-    pipe, tokenizer = create_generation_pipeline(
+    pipe, tokenizer, _device = modeling.create_generation_pipeline(
         model_path=model_path,
         device_id=int(cuda_id_list[0]) if cuda_id_list else cuda_id,
+        fix_mistral_regex=True,
+        log=False,
     )
-    judge_client = beacon.OpenAICompatClient(
+    judge_client = mtbench_utils.OpenAICompatClient(
         base_url=api_config["openai_base_url"],
         api_key=api_config["openai_api_key"],
         model=api_config["judge_model"],
@@ -441,7 +428,11 @@ def main(
     def flush() -> None:
         judged_answers = [{"score": r.get("score")} for r in results if r.get("score") is not None]
         references = [r.get("judge") for r in results if r.get("score") is not None]
-        metrics = beacon.get_final_results(judged_answers, references) if judged_answers else {}
+        metrics = (
+            mtbench_utils.get_final_results(judged_answers, references)
+            if judged_answers
+            else {}
+        )
         output = {
             "meta": {
                 "timestamp": timestamp,
@@ -460,7 +451,7 @@ def main(
             "errors": errors,
         }
         try:
-            beacon.write_json_atomic(output_path, output)
+            common.write_json_atomic(output_path, output)
         except Exception as e:
             print(f"[WARN] Failed to write {output_path}: {e}")
 
@@ -506,7 +497,9 @@ def main(
 
     judged_answers = [{"score": r.get("score")} for r in results if r.get("score") is not None]
     references = [r.get("judge") for r in results if r.get("score") is not None]
-    metrics = beacon.get_final_results(judged_answers, references) if judged_answers else {}
+    metrics = (
+        mtbench_utils.get_final_results(judged_answers, references) if judged_answers else {}
+    )
     print("\n=== MTBench_101 METRICS ===")
     print(json.dumps(metrics, indent=2, ensure_ascii=False))
     print(f"\nSaved to: {output_path}")
