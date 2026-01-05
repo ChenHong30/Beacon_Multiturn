@@ -172,11 +172,10 @@ def _run_worker(
     log_dir: str,
     timestamp: str,
     run_tag: str,
-    split_names: List[str],
-    english_indices_by_split: Dict[str, List[int]],
     verbose: bool,
     flush_every: int,
     progress_counter: Optional[Any],
+    task_queue: Any,
 ) -> None:
     worker_out = _worker_output_path(log_dir, timestamp, run_tag, worker_id)
 
@@ -198,7 +197,6 @@ def _run_worker(
                 "worker_id": worker_id,
                 "num_workers": num_workers,
                 "run_tag": run_tag,
-                "splits": split_names,
                 "attempted": len(all_eval_results) + len(errors),
                 "succeeded": len(all_eval_results),
                 "failed": len(errors),
@@ -212,60 +210,58 @@ def _run_worker(
             print(f"[WARN] Failed to write {worker_out}: {e}")
 
     flush()
+    processed = 0
+
     try:
-        global_english_idx = 0
-        processed = 0
-        for split in split_names:
-            orig_indices = english_indices_by_split.get(split) or []
-            for en_idx, orig_idx in enumerate(orig_indices):
-                if global_english_idx % num_workers != worker_id:
-                    global_english_idx += 1
-                    continue
+        while True:
+            task = task_queue.get()
+            if task is None:
+                break
 
+            # Unpack task
+            (split, en_idx, orig_idx, global_english_idx) = task
+
+            try:
                 sample = ds[split][orig_idx]
-                try:
-                    generated_responses = run_multi_if_sample(
-                        sample=sample,
-                        pipe=pipe,
-                        tokenizer=tokenizer,
-                        device=device,
-                        verbose=verbose,
-                    )
-                    eval_result = eval_multi_if_sample(
-                        sample=sample,
-                        generated_responses=generated_responses,
-                    )
-                    eval_result["split"] = split
-                    eval_result["index"] = en_idx
-                    eval_result["orig_index"] = orig_idx
-                    eval_result["global_index"] = global_english_idx
-                    all_eval_results.append(eval_result)
-                except Exception as e:
-                    errors.append(
-                        {
-                            "split": split,
-                            "index": en_idx,
-                            "orig_index": orig_idx,
-                            "global_index": global_english_idx,
-                            "key": sample.get("key"),
-                            "error": repr(e),
-                        }
-                    )
-                finally:
-                    global_english_idx += 1
-                    processed += 1
-                    if progress_counter is not None:
-                        try:
-                            with progress_counter.get_lock():
-                                progress_counter.value += 1
-                        except Exception:
-                            pass
-                    if flush_every > 0 and (processed % flush_every == 0):
-                        flush()
+                generated_responses = run_multi_if_sample(
+                    sample=sample,
+                    pipe=pipe,
+                    tokenizer=tokenizer,
+                    device=device,
+                    verbose=verbose,
+                )
+                eval_result = eval_multi_if_sample(
+                    sample=sample,
+                    generated_responses=generated_responses,
+                )
+                eval_result["split"] = split
+                eval_result["index"] = en_idx
+                eval_result["orig_index"] = orig_idx
+                eval_result["global_index"] = global_english_idx
+                all_eval_results.append(eval_result)
+            except Exception as e:
+                errors.append(
+                    {
+                        "split": split,
+                        "index": en_idx,
+                        "orig_index": orig_idx,
+                        "global_index": global_english_idx,
+                        "key": sample.get("key") if 'sample' in locals() else "unknown",
+                        "error": repr(e),
+                    }
+                )
+            finally:
+                processed += 1
+                if progress_counter is not None:
+                    try:
+                        with progress_counter.get_lock():
+                            progress_counter.value += 1
+                    except Exception:
+                        pass
+                if flush_every > 0 and (processed % flush_every == 0):
+                    flush()
     finally:
-        pass
-
-    flush()
+        flush()
 
 
 # ============================================================
@@ -493,6 +489,7 @@ def main(
     log_dir: Optional[str] = None,
     verbose: bool = False,
     flush_every: int = 1,
+    num_workers: int = 16,
 ):
     resolved_log_dir = log_dir or os.path.join(PROJECT_ROOT, "logs")
     os.makedirs(resolved_log_dir, exist_ok=True)
@@ -511,31 +508,47 @@ def main(
     # Multi-GPU: one process per GPU, shard by global_index % num_workers
     # ============================================================
     if torch.cuda.is_available() and len(cuda_id_list) > 1:
-        num_workers = len(cuda_id_list)
+        # Prepare Queue
+        ctx = mp.get_context("spawn")
+        task_queue = ctx.Queue()
+
+        print(f"Generating tasks for {total_english} samples...")
+        global_english_idx = 0
+        for split in split_names:
+            orig_indices = english_indices_by_split.get(split) or []
+            for en_idx, orig_idx in enumerate(orig_indices):
+                # Task: (split, en_idx, orig_idx, global_english_idx)
+                task_queue.put((split, en_idx, orig_idx, global_english_idx))
+                global_english_idx += 1
+
+        final_num_workers = num_workers
+        for _ in range(final_num_workers):
+            task_queue.put(None)
+
+        print(f"Launching {final_num_workers} workers on devices: {cuda_id_list or 'CPU'}...")
         worker_paths = [
             _worker_output_path(resolved_log_dir, timestamp, run_tag, wid)
-            for wid in range(num_workers)
+            for wid in range(final_num_workers)
         ]
 
-        ctx = mp.get_context("spawn")
         progress_counter = ctx.Value("i", 0)
         procs: List[mp.Process] = []
-        for wid, cid in enumerate(cuda_id_list):
+        for wid in range(final_num_workers):
+            cid = cuda_id_list[wid % len(cuda_id_list)]
             p = ctx.Process(
                 target=_run_worker,
                 kwargs={
                     "worker_id": wid,
-                    "num_workers": num_workers,
+                    "num_workers": final_num_workers,
                     "cuda_id": cid,
                     "model_path": model_path,
                     "log_dir": resolved_log_dir,
                     "timestamp": timestamp,
                     "run_tag": run_tag,
-                    "split_names": split_names,
-                    "english_indices_by_split": english_indices_by_split,
                     "verbose": verbose,
                     "flush_every": flush_every,
                     "progress_counter": progress_counter,
+                    "task_queue": task_queue,
                 },
             )
             p.start()
@@ -582,7 +595,7 @@ def main(
                 failed_workers.append(
                     {
                         "worker_id": wid,
-                        "cuda_id": cuda_id_list[wid],
+                        "cuda_id": cuda_id_list[wid % len(cuda_id_list)],
                         "exitcode": p.exitcode,
                     }
                 )

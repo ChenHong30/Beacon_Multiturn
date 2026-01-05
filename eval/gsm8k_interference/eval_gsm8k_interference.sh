@@ -4,13 +4,22 @@ IS_BEACON=true
 BEACON_MODEL_PATH="/data/hkustgz/model_weight/8_beacon_0_sink_distill_v2_turn_embedding"
 BASE_MODEL_PATH="/data/hkustgz/model_weight/Qwen3-0.6B"
 CUDA_ID=0,1,2,3
-LOG_DIR="/home/hkustgz/Beacon_Multiturn/logs/multi_if/8_beacon_128_sink_distill_v2_turn_embedding"
-NUM_SINKS=128
-NUM_WORKERS=32
-BEACON_SCRIPT="eval/multi_if/eval_multi_if_beacon.py"
-BASE_SCRIPT="eval/multi_if/eval_multi_if_base.py"
+LOG_DIR="/home/hkustgz/Beacon_Multiturn/logs/gsm8k_interference/8_beacon_0_sink_distill_v2_turn_embedding"
 
-echo "🚀 Evaluating Multi-IF..."
+# GSM8K Specific Config
+HISTORY_MAX_TURNS=6
+MAX_INPUT_TOKENS=4096
+MAX_NEW_TOKENS=1024
+ULTRACHAT_PATH="/home/hkustgz/Beacon_Multiturn/ultrachat-200k.jsonl"
+GSM8K_SPLIT="test"
+TEMPERATURE=0.7
+
+NUM_SINKS=0
+NUM_WORKERS=32
+BEACON_SCRIPT="eval/gsm8k_interference/eval_gsm8k_interference_beacon.py"
+BASE_SCRIPT="eval/gsm8k_interference/eval_gsm8k_interference_base.py"
+
+echo "🚀 Evaluating GSM8K Interference..."
 echo "----------------------------------------------------"
 if [ "$IS_BEACON" = "true" ]; then
     echo "Model Path: $BEACON_MODEL_PATH"
@@ -22,6 +31,9 @@ fi
 echo "CUDA ID   : $CUDA_ID"
 echo "Workers   : $NUM_WORKERS"
 echo "Log Dir   : $LOG_DIR"
+echo "Split     : $GSM8K_SPLIT"
+echo "Turns     : $HISTORY_MAX_TURNS"
+echo "Temp      : $TEMPERATURE"
 if [ "$IS_BEACON" = "true" ]; then
     echo "Mode      : BEACON (Num Sinks: $NUM_SINKS)"
 else
@@ -49,7 +61,13 @@ if [ "$IS_BEACON" = "true" ]; then
         --cuda_ids="$CUDA_ID" \
         --log_dir="$LOG_DIR" \
         --num_sinks="$NUM_SINKS" \
-        --num_workers="$NUM_WORKERS"
+        --num_workers="$NUM_WORKERS" \
+        --ultrachat_path="$ULTRACHAT_PATH" \
+        --history_max_turns="$HISTORY_MAX_TURNS" \
+        --max_input_tokens="$MAX_INPUT_TOKENS" \
+        --max_new_tokens="$MAX_NEW_TOKENS" \
+        --gsm8k_split="$GSM8K_SPLIT" \
+        --temperature="$TEMPERATURE"
 
 else
     # ------------------------------------
@@ -61,5 +79,11 @@ else
         --model_path="$BASE_MODEL_PATH" \
         --cuda_ids="$CUDA_ID" \
         --log_dir="$LOG_DIR" \
-        --num_workers="$NUM_WORKERS"
+        --num_workers="$NUM_WORKERS" \
+        --ultrachat_path="$ULTRACHAT_PATH" \
+        --history_max_turns="$HISTORY_MAX_TURNS" \
+        --max_input_tokens="$MAX_INPUT_TOKENS" \
+        --max_new_tokens="$MAX_NEW_TOKENS" \
+        --gsm8k_split="$GSM8K_SPLIT" \
+        --temperature="$TEMPERATURE"
 fi

@@ -1,7 +1,7 @@
 #!/bin/bash
 
 IS_BEACON=true
-BEACON_MODEL_PATH="/home/hkustgz/Beacon_Multiturn/model_weight/8_beacon_0_sink_distill_generated_dual_attn_temp_2"
+BEACON_MODEL_PATH="/home/hkustgz/Beacon_Multiturn/model_weight/8_beacon_0_sink_distill_v2_turn_embedding"
 BASE_MODEL_PATH="/data/hkustgz/model_weight/Qwen3-0.6B"
 CUDA_ID=0
 LOG_DIR="./logs/mtbench_101"
@@ -16,6 +16,7 @@ TEMPERATURE=0.7
 DO_SAMPLE=true
 TOP_P=""
 FLUSH_EVERY=1
+NUM_WORKERS=16
 
 BEACON_SCRIPT="eval/mtbench_101/eval_mtbench_101_beacon.py"
 BASE_SCRIPT="eval/mtbench_101/eval_mtbench_101_base.py"
@@ -28,6 +29,7 @@ else
     echo "Model Path: $BASE_MODEL_PATH"
 fi
 echo "CUDA ID   : $CUDA_ID"
+echo "Workers   : $NUM_WORKERS"
 echo "Log Dir   : $LOG_DIR"
 echo "Data Path : $DATA_PATH"
 if [ -n "$DATA_NAME" ]; then
@@ -74,7 +76,8 @@ if [ "$IS_BEACON" = "true" ]; then
         --temperature="$TEMPERATURE" \
         --do_sample="$DO_SAMPLE" \
         $TOP_P_ARG \
-        --flush_every="$FLUSH_EVERY"
+        --flush_every="$FLUSH_EVERY" \
+        --num_workers="$NUM_WORKERS"
 else
     echo "▶️   Running Base Evaluation script: $BASE_SCRIPT"
     python "$BASE_SCRIPT" \
@@ -88,5 +91,6 @@ else
         --temperature="$TEMPERATURE" \
         --do_sample="$DO_SAMPLE" \
         $TOP_P_ARG \
-        --flush_every="$FLUSH_EVERY"
+        --flush_every="$FLUSH_EVERY" \
+        --num_workers="$NUM_WORKERS"
 fi

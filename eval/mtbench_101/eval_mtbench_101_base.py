@@ -162,7 +162,6 @@ def _run_worker(
     log_dir: str,
     timestamp: str,
     run_tag: str,
-    conversations: List[Dict[str, Any]],
     api_config: Dict[str, Any],
     max_new_tokens: int,
     temperature: float,
@@ -170,6 +169,7 @@ def _run_worker(
     top_p: Optional[float],
     flush_every: int,
     progress_counter: Optional[Any],
+    task_queue: Any,
 ) -> None:
     worker_out = _worker_output_path(log_dir, timestamp, run_tag, worker_id)
 
@@ -218,44 +218,49 @@ def _run_worker(
     flush()
 
     processed = 0
-    for idx, dialogue in enumerate(conversations):
-        if idx % num_workers != worker_id:
-            continue
-        try:
-            dialog_results = _evaluate_dialogue(
-                dialogue=dialogue,
-                dialogue_index=idx,
-                pipe=pipe,
-                tokenizer=tokenizer,
-                judge_client=judge_client,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                do_sample=do_sample,
-                top_p=top_p,
-            )
-            results.extend(dialog_results)
-        except Exception as e:
-            errors.append(
-                {
-                    "dialogue_index": idx,
-                    "id": dialogue.get("id"),
-                    "task": dialogue.get("task"),
-                    "error": repr(e),
-                }
-            )
-        finally:
-            processed += 1
-            processed_dialogues += 1
-            if progress_counter is not None:
-                try:
-                    with progress_counter.get_lock():
-                        progress_counter.value += 1
-                except Exception:
-                    pass
-            if flush_every > 0 and (processed % flush_every == 0):
-                flush()
-
-    flush()
+    try:
+        while True:
+            task = task_queue.get()
+            if task is None:
+                break
+            
+            idx, dialogue = task
+            
+            try:
+                dialog_results = _evaluate_dialogue(
+                    dialogue=dialogue,
+                    dialogue_index=idx,
+                    pipe=pipe,
+                    tokenizer=tokenizer,
+                    judge_client=judge_client,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    do_sample=do_sample,
+                    top_p=top_p,
+                )
+                results.extend(dialog_results)
+            except Exception as e:
+                errors.append(
+                    {
+                        "dialogue_index": idx,
+                        "id": dialogue.get("id"),
+                        "task": dialogue.get("task"),
+                        "error": repr(e),
+                    }
+                )
+            finally:
+                processed += 1
+                processed_dialogues += 1
+                if progress_counter is not None:
+                    try:
+                        with progress_counter.get_lock():
+                            progress_counter.value += 1
+                    except Exception:
+                        pass
+                if flush_every > 0 and (processed % flush_every == 0):
+                    flush()
+    finally:
+        flush()
 
 
 def main(
@@ -271,6 +276,7 @@ def main(
     do_sample: bool = True,
     top_p: Optional[float] = None,
     flush_every: int = 1,
+    num_workers: int = 16,
 ) -> str:
     try:
         from tqdm.auto import tqdm
@@ -296,220 +302,155 @@ def main(
     cuda_id_list = beacon._parse_cuda_ids(cuda_id=cuda_id, cuda_ids=cuda_ids)
     beacon._validate_cuda_ids(cuda_id_list)
 
-    use_multi = torch.cuda.is_available() and len(cuda_id_list) > 1
+    final_num_workers = num_workers if (torch.cuda.is_available() and len(cuda_id_list) > 0) else 1
+    if not torch.cuda.is_available():
+        final_num_workers = 1
 
-    if use_multi:
-        num_workers = len(cuda_id_list)
-        worker_paths = [
-            _worker_output_path(resolved_log_dir, timestamp, run_tag, wid)
-            for wid in range(num_workers)
-        ]
+    print(f"Plan: {final_num_workers} workers on devices: {cuda_id_list or 'CPU'}")
 
-        ctx = mp.get_context("spawn")
-        progress_counter = ctx.Value("i", 0)
-        procs: List[mp.Process] = []
-        for wid, cid in enumerate(cuda_id_list):
-            p = ctx.Process(
-                target=_run_worker,
-                kwargs={
-                    "worker_id": wid,
-                    "num_workers": num_workers,
-                    "cuda_id": cid,
-                    "model_path": model_path,
-                    "log_dir": resolved_log_dir,
-                    "timestamp": timestamp,
-                    "run_tag": run_tag,
-                    "conversations": conversations,
-                    "api_config": api_config,
-                    "max_new_tokens": max_new_tokens,
-                    "temperature": temperature,
-                    "do_sample": do_sample,
-                    "top_p": top_p,
-                    "flush_every": flush_every,
-                    "progress_counter": progress_counter,
-                },
-            )
-            p.start()
-            procs.append(p)
+    # Prepare Queue
+    ctx = mp.get_context("spawn")
+    task_queue = ctx.Queue()
+    
+    for idx, dialogue in enumerate(conversations):
+        task_queue.put((idx, dialogue))
+        
+    for _ in range(final_num_workers):
+        task_queue.put(None)
 
-        pbar = None
-        if tqdm is not None:
-            pbar = tqdm(total=len(conversations), desc="Evaluating MTBench_101", unit="dialogue")
-        last = 0
-        try:
-            while any(p.is_alive() for p in procs):
-                try:
-                    with progress_counter.get_lock():
-                        current = int(progress_counter.value)
-                except Exception:
-                    current = last
-                if current > last and pbar is not None:
-                    step = min(current - last, len(conversations) - last)
-                    if step > 0:
-                        pbar.update(step)
-                        last += step
-                time.sleep(0.2)
-        finally:
-            if pbar is not None:
-                pbar.close()
+    worker_paths = [
+        _worker_output_path(resolved_log_dir, timestamp, run_tag, wid)
+        for wid in range(final_num_workers)
+    ]
 
-        for p in procs:
-            p.join()
-
-        failed_workers = []
-        for wid, p in enumerate(procs):
-            if p.exitcode != 0:
-                failed_workers.append(
-                    {
-                        "worker_id": wid,
-                        "cuda_id": cuda_id_list[wid],
-                        "exitcode": p.exitcode,
-                    }
-                )
-
-        all_results: List[Dict[str, Any]] = []
-        errors: List[Dict[str, Any]] = []
-        for wp in worker_paths:
-            if not os.path.exists(wp):
-                print(f"[WARN] Missing worker output: {wp}")
-                continue
-            try:
-                with open(wp, "r", encoding="utf-8") as f:
-                    d = json.load(f)
-                all_results.extend(d.get("results") or [])
-                errors.extend(d.get("errors") or [])
-            except Exception as e:
-                print(f"[WARN] Failed to read {wp}: {e}")
-
-        all_results.sort(key=lambda r: (r.get("dialogue_index"), r.get("turn_id")))
-
-        judged_answers = [{"score": r.get("score")} for r in all_results if r.get("score") is not None]
-        references = [r.get("judge") for r in all_results if r.get("score") is not None]
-        results = beacon.get_final_results(judged_answers, references) if judged_answers else {}
-
-        output = {
-            "meta": {
-                "timestamp": timestamp,
+    progress_counter = ctx.Value("i", 0)
+    procs: List[mp.Process] = []
+    
+    for wid in range(final_num_workers):
+        if cuda_id_list:
+            cid = cuda_id_list[wid % len(cuda_id_list)]
+        else:
+            cid = 0
+            
+        p = ctx.Process(
+            target=_run_worker,
+            kwargs={
+                "worker_id": wid,
+                "num_workers": final_num_workers,
+                "cuda_id": cid,
                 "model_path": model_path,
-                "cuda_ids": cuda_id_list,
                 "log_dir": resolved_log_dir,
-                "num_workers": num_workers,
-                "num_dialogues": len(conversations),
-                "run_tag": run_tag,
-                "judge_model": api_config["judge_model"],
-                "attempted_items": len(all_results),
-                "failed_dialogues": len(errors),
-                "worker_outputs": worker_paths,
-                "failed_workers": failed_workers,
-            },
-            "metrics": results,
-            "results": all_results,
-            "errors": errors,
-        }
-        beacon.write_json_atomic(output_path, output)
-
-        print("\n=== MTBench_101 METRICS ===")
-        print(json.dumps(results, indent=2, ensure_ascii=False))
-        print(f"\nSaved to: {output_path}")
-        if failed_workers:
-            raise SystemExit(
-                f"{len(failed_workers)}/{num_workers} workers failed; "
-                f"partial results saved to: {output_path}"
-            )
-        return output_path
-
-    pipe, tokenizer = create_generation_pipeline(
-        model_path=model_path,
-        device_id=int(cuda_id_list[0]) if cuda_id_list else cuda_id,
-    )
-    judge_client = beacon.OpenAICompatClient(
-        base_url=api_config["openai_base_url"],
-        api_key=api_config["openai_api_key"],
-        model=api_config["judge_model"],
-        timeout=api_config.get("request_timeout", 120),
-        max_retries=api_config.get("max_retries", 3),
-        retry_sleep=api_config.get("retry_sleep", 1.0),
-        temperature=api_config.get("temperature", 0.0),
-        top_p=api_config.get("top_p", 1.0),
-        max_tokens=api_config.get("max_tokens", 512),
-    )
-
-    results: List[Dict[str, Any]] = []
-    errors: List[Dict[str, Any]] = []
-    processed_dialogues = 0
-
-    def flush() -> None:
-        judged_answers = [{"score": r.get("score")} for r in results if r.get("score") is not None]
-        references = [r.get("judge") for r in results if r.get("score") is not None]
-        metrics = beacon.get_final_results(judged_answers, references) if judged_answers else {}
-        output = {
-            "meta": {
                 "timestamp": timestamp,
-                "model_path": model_path,
-                "cuda_id": int(cuda_id_list[0]) if cuda_id_list else cuda_id,
-                "log_dir": resolved_log_dir,
-                "num_dialogues": len(conversations),
                 "run_tag": run_tag,
-                "judge_model": api_config["judge_model"],
-                "processed_dialogues": processed_dialogues,
-                "attempted_items": len(results),
-                "failed_dialogues": len(errors),
+                "api_config": api_config,
+                "max_new_tokens": max_new_tokens,
+                "temperature": temperature,
+                "do_sample": do_sample,
+                "top_p": top_p,
+                "flush_every": flush_every,
+                "progress_counter": progress_counter,
+                "task_queue": task_queue,
             },
-            "metrics": metrics,
-            "results": results,
-            "errors": errors,
-        }
-        try:
-            beacon.write_json_atomic(output_path, output)
-        except Exception as e:
-            print(f"[WARN] Failed to write {output_path}: {e}")
+        )
+        p.start()
+        procs.append(p)
 
-    flush()
-
-    pbar = tqdm(total=len(conversations), desc="Evaluating MTBench_101", unit="dialogue") if tqdm else None
+    pbar = None
+    if tqdm is not None:
+        pbar = tqdm(total=len(conversations), desc="Evaluating MTBench_101", unit="dialogue")
+    
+    last = 0
     try:
-        for idx, dialogue in enumerate(conversations):
-            if pbar is not None:
-                pbar.set_postfix(idx=idx)
+        while any(p.is_alive() for p in procs):
             try:
-                dialog_results = _evaluate_dialogue(
-                    dialogue=dialogue,
-                    dialogue_index=idx,
-                    pipe=pipe,
-                    tokenizer=tokenizer,
-                    judge_client=judge_client,
-                    max_new_tokens=max_new_tokens,
-                    temperature=temperature,
-                    do_sample=do_sample,
-                    top_p=top_p,
-                )
-                results.extend(dialog_results)
-            except Exception as e:
-                errors.append(
-                    {
-                        "dialogue_index": idx,
-                        "id": dialogue.get("id"),
-                        "task": dialogue.get("task"),
-                        "error": repr(e),
-                    }
-                )
-            if pbar is not None:
-                pbar.update(1)
-            processed_dialogues += 1
-            if flush_every > 0 and ((idx + 1) % flush_every == 0):
-                flush()
+                with progress_counter.get_lock():
+                    current = int(progress_counter.value)
+            except Exception:
+                current = last
+            if current > last and pbar is not None:
+                step = min(current - last, len(conversations) - last)
+                if step > 0:
+                    pbar.update(step)
+                    last += step
+            time.sleep(0.5)
+            
+        try:
+            with progress_counter.get_lock():
+                current = int(progress_counter.value)
+        except Exception:
+            current = last
+        if current > last and pbar is not None:
+            step = min(current - last, len(conversations) - last)
+            if step > 0:
+                pbar.update(step)
+                last += step
     finally:
         if pbar is not None:
             pbar.close()
 
-    flush()
+    for p in procs:
+        p.join()
 
-    judged_answers = [{"score": r.get("score")} for r in results if r.get("score") is not None]
-    references = [r.get("judge") for r in results if r.get("score") is not None]
-    metrics = beacon.get_final_results(judged_answers, references) if judged_answers else {}
+    failed_workers = []
+    for wid, p in enumerate(procs):
+        if p.exitcode != 0:
+            failed_workers.append(
+                {
+                    "worker_id": wid,
+                    "cuda_id": cuda_id_list[wid % len(cuda_id_list)] if cuda_id_list else 0,
+                    "exitcode": p.exitcode,
+                }
+            )
+
+    all_results: List[Dict[str, Any]] = []
+    errors: List[Dict[str, Any]] = []
+    for wp in worker_paths:
+        if not os.path.exists(wp):
+            print(f"[WARN] Missing worker output: {wp}")
+            continue
+        try:
+            with open(wp, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            all_results.extend(d.get("results") or [])
+            errors.extend(d.get("errors") or [])
+        except Exception as e:
+            print(f"[WARN] Failed to read {wp}: {e}")
+
+    all_results.sort(key=lambda r: (r.get("dialogue_index"), r.get("turn_id")))
+
+    judged_answers = [{"score": r.get("score")} for r in all_results if r.get("score") is not None]
+    references = [r.get("judge") for r in all_results if r.get("score") is not None]
+    results = beacon.get_final_results(judged_answers, references) if judged_answers else {}
+
+    output = {
+        "meta": {
+            "timestamp": timestamp,
+            "model_path": model_path,
+            "cuda_ids": cuda_id_list,
+            "log_dir": resolved_log_dir,
+            "num_workers": final_num_workers,
+            "num_dialogues": len(conversations),
+            "run_tag": run_tag,
+            "judge_model": api_config["judge_model"],
+            "attempted_items": len(all_results),
+            "failed_dialogues": len(errors),
+            "worker_outputs": worker_paths,
+            "failed_workers": failed_workers,
+        },
+        "metrics": results,
+        "results": all_results,
+        "errors": errors,
+    }
+    beacon.write_json_atomic(output_path, output)
+
     print("\n=== MTBench_101 METRICS ===")
-    print(json.dumps(metrics, indent=2, ensure_ascii=False))
+    print(json.dumps(results, indent=2, ensure_ascii=False))
     print(f"\nSaved to: {output_path}")
+    if failed_workers:
+        raise SystemExit(
+            f"{len(failed_workers)}/{final_num_workers} workers failed; "
+            f"partial results saved to: {output_path}"
+        )
     return output_path
 
 
@@ -535,6 +476,7 @@ if __name__ == "__main__":
     parser.add_argument("--do-sample", "--do_sample", dest="do_sample", type=lambda x: str(x).lower() != "false", default=True)
     parser.add_argument("--top-p", "--top_p", dest="top_p", type=float, default=None)
     parser.add_argument("--flush-every", "--flush_every", dest="flush_every", type=int, default=1)
+    parser.add_argument("--num-workers", "--num_workers", dest="num_workers", type=int, default=16)
     args = parser.parse_args()
 
     main(
@@ -550,4 +492,5 @@ if __name__ == "__main__":
         do_sample=args.do_sample,
         top_p=args.top_p,
         flush_every=args.flush_every,
+        num_workers=args.num_workers,
     )

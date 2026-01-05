@@ -146,26 +146,29 @@ def _run_worker(
     log_dir: str,
     timestamp: str,
     run_tag: str,
-    split_names: List[str],
-    english_indices_by_split: Dict[str, List[int]],
     verbose: bool,
     flush_every: int,
     progress_counter: Optional[Any],
+    task_queue: Any,
 ) -> None:
     worker_out = _worker_output_path(log_dir, timestamp, run_tag, worker_id)
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_path,
-        trust_remote_code=True,
-        fix_mistral_regex=True,
-    )
-    model, device = load_beacon_model(
-        model_path,
-        device_id=cuda_id,
-        num_sinks=num_sinks,
-    )
-
-    ds = load_dataset("facebook/Multi-IF")
+    # Initialize model
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_path,
+            trust_remote_code=True,
+            fix_mistral_regex=True,
+        )
+        model, device = load_beacon_model(
+            model_path,
+            device_id=cuda_id,
+            num_sinks=num_sinks,
+        )
+        ds = load_dataset("facebook/Multi-IF")
+    except Exception as e:
+        print(f"[Worker {worker_id}] Init failed: {e}")
+        return
 
     all_eval_results: List[Dict[str, Any]] = []
     errors: List[Dict[str, Any]] = []
@@ -180,7 +183,6 @@ def _run_worker(
                 "num_workers": num_workers,
                 "run_tag": run_tag,
                 "num_sinks": num_sinks,
-                "splits": split_names,
                 "attempted": len(all_eval_results) + len(errors),
                 "succeeded": len(all_eval_results),
                 "failed": len(errors),
@@ -194,60 +196,62 @@ def _run_worker(
             print(f"[WARN] Failed to write {worker_out}: {e}")
 
     flush()
+    processed = 0
+
     try:
-        global_english_idx = 0
-        processed = 0
-        for split in split_names:
-            orig_indices = english_indices_by_split.get(split) or []
-            for en_idx, orig_idx in enumerate(orig_indices):
-                if global_english_idx % num_workers != worker_id:
-                    global_english_idx += 1
-                    continue
+        while True:
+            task = task_queue.get()
+            if task is None:
+                break
 
+            # Unpack task
+            (split, en_idx, orig_idx, global_english_idx) = task
+
+            try:
                 sample = ds[split][orig_idx]
-                try:
-                    generated_responses = run_multi_if_sample(
-                        sample=sample,
-                        model=model,
-                        tokenizer=tokenizer,
-                        device=device,
-                        verbose=verbose,
-                    )
-                    eval_result = eval_multi_if_sample(
-                        sample=sample,
-                        generated_responses=generated_responses,
-                    )
-                    eval_result["split"] = split
-                    eval_result["index"] = en_idx
-                    eval_result["orig_index"] = orig_idx
-                    eval_result["global_index"] = global_english_idx
-                    all_eval_results.append(eval_result)
-                except Exception as e:
-                    errors.append(
-                        {
-                            "split": split,
-                            "index": en_idx,
-                            "orig_index": orig_idx,
-                            "global_index": global_english_idx,
-                            "key": sample.get("key"),
-                            "error": repr(e),
-                        }
-                    )
-                finally:
-                    global_english_idx += 1
-                    processed += 1
-                    if progress_counter is not None:
-                        try:
-                            with progress_counter.get_lock():
-                                progress_counter.value += 1
-                        except Exception:
-                            pass
-                    if flush_every > 0 and (processed % flush_every == 0):
-                        flush()
-    finally:
-        pass
+                generated_responses = run_multi_if_sample(
+                    sample=sample,
+                    model=model,
+                    tokenizer=tokenizer,
+                    device=device,
+                    verbose=verbose,
+                )
+                eval_result = eval_multi_if_sample(
+                    sample=sample,
+                    generated_responses=generated_responses,
+                )
+                eval_result["split"] = split
+                eval_result["index"] = en_idx
+                eval_result["orig_index"] = orig_idx
+                eval_result["global_index"] = global_english_idx
+                all_eval_results.append(eval_result)
+            except Exception as e:
+                errors.append(
+                    {
+                        "split": split,
+                        "index": en_idx,
+                        "orig_index": orig_idx,
+                        "global_index": global_english_idx,
+                        "key": sample.get("key") if 'sample' in locals() else "unknown",
+                        "error": repr(e),
+                    }
+                )
+            finally:
+                processed += 1
+                if progress_counter is not None:
+                    try:
+                        with progress_counter.get_lock():
+                            progress_counter.value += 1
+                    except Exception:
+                        pass
+                
+                if flush_every > 0 and (processed % flush_every == 0):
+                    flush()
 
-    flush()
+    except Exception as e:
+        print(f"[Worker {worker_id}] Crash: {e}")
+    finally:
+        flush()
 
 
 # ============================================================
@@ -487,6 +491,7 @@ def main(
     verbose: bool = False,
     num_sinks: int = 1,
     flush_every: int = 1,
+    num_workers: int = 16,
 ):
     resolved_log_dir = log_dir or os.path.join(PROJECT_ROOT, "logs")
     os.makedirs(resolved_log_dir, exist_ok=True)
@@ -517,240 +522,174 @@ def main(
 
     split_names, english_indices_by_split = _get_english_indices_by_split(ds)
     total_english = sum(len(v) for v in english_indices_by_split.values())
+    
+    # --------------------------------------------------------
+    # Task Queue Setup
+    # --------------------------------------------------------
+    ctx = mp.get_context("spawn")
+    task_queue = ctx.Queue()
+    
+    # Fill Queue with tasks
+    print(f"Generating tasks for {total_english} samples...")
+    global_english_idx = 0
+    for split in split_names:
+        orig_indices = english_indices_by_split.get(split) or []
+        for en_idx, orig_idx in enumerate(orig_indices):
+            # Task tuple: (split, en_idx, orig_idx, global_english_idx)
+            task_queue.put((split, en_idx, orig_idx, global_english_idx))
+            global_english_idx += 1
+            
+    # Add termination signals
+    final_num_workers = num_workers if (torch.cuda.is_available() and len(cuda_id_list) > 0) else 1
+    
+    # If no cuda devices or just 1 worker requested, we still use the queue logic.
+    # Just need to ensure final_num_workers is logical.
+    if not torch.cuda.is_available():
+        final_num_workers = 1
+        
+    for _ in range(final_num_workers):
+        task_queue.put(None)
+        
+    print(f"Launching {final_num_workers} workers on devices: {cuda_id_list or 'CPU'}...")
+    
+    worker_paths = [
+        _worker_output_path(resolved_log_dir, timestamp, run_tag, wid)
+        for wid in range(final_num_workers)
+    ]
 
-    # ============================================================
-    # Multi-GPU: one process per GPU, shard by global_index % num_workers
-    # ============================================================
-    if torch.cuda.is_available() and len(cuda_id_list) > 1:
-        num_workers = len(cuda_id_list)
-        worker_paths = [
-            _worker_output_path(resolved_log_dir, timestamp, run_tag, wid)
-            for wid in range(num_workers)
-        ]
+    progress_counter = ctx.Value("i", 0)
+    procs: List[mp.Process] = []
+    
+    for wid in range(final_num_workers):
+        # Round-robin GPU assignment
+        if cuda_id_list:
+            cid = cuda_id_list[wid % len(cuda_id_list)]
+        else:
+            cid = 0
 
-        ctx = mp.get_context("spawn")
-        progress_counter = ctx.Value("i", 0)
-        procs: List[mp.Process] = []
-        for wid, cid in enumerate(cuda_id_list):
-            p = ctx.Process(
-                target=_run_worker,
-                kwargs={
-                    "worker_id": wid,
-                    "num_workers": num_workers,
-                    "cuda_id": cid,
-                    "model_path": model_path,
-                    "num_sinks": num_sinks,
-                    "log_dir": resolved_log_dir,
-                    "timestamp": timestamp,
-                    "run_tag": run_tag,
-                    "split_names": split_names,
-                    "english_indices_by_split": english_indices_by_split,
-                    "verbose": verbose,
-                    "flush_every": flush_every,
-                    "progress_counter": progress_counter,
-                },
-            )
-            p.start()
-            procs.append(p)
+        p = ctx.Process(
+            target=_run_worker,
+            kwargs={
+                "worker_id": wid,
+                "num_workers": final_num_workers,
+                "cuda_id": cid,
+                "model_path": model_path,
+                "num_sinks": num_sinks,
+                "log_dir": resolved_log_dir,
+                "timestamp": timestamp,
+                "run_tag": run_tag,
+                "verbose": verbose,
+                "flush_every": flush_every,
+                "progress_counter": progress_counter,
+                "task_queue": task_queue,
+            },
+        )
+        p.start()
+        procs.append(p)
 
-        pbar = tqdm(total=total_english, desc="Evaluating Multi-IF (English)", unit="sample")
-        last = 0
-        try:
-            while any(p.is_alive() for p in procs):
-                try:
-                    with progress_counter.get_lock():
-                        current = int(progress_counter.value)
-                except Exception:
-                    current = last
-
-                if current > last:
-                    step = min(current - last, total_english - last)
-                    if step > 0:
-                        pbar.update(step)
-                        last += step
-
-                time.sleep(0.2)
-
-            # Final update after all workers finished.
+    # Monitor progress
+    pbar = tqdm(total=total_english, desc="Evaluating Multi-IF (English)", unit="sample")
+    last = 0
+    try:
+        while any(p.is_alive() for p in procs):
             try:
                 with progress_counter.get_lock():
                     current = int(progress_counter.value)
             except Exception:
                 current = last
+
             if current > last:
                 step = min(current - last, total_english - last)
                 if step > 0:
                     pbar.update(step)
                     last += step
-        finally:
-            pbar.close()
 
-        for p in procs:
-            p.join()
+            time.sleep(0.5)
 
-        failed_workers = []
-        for wid, p in enumerate(procs):
-            if p.exitcode != 0:
-                failed_workers.append(
-                    {
-                        "worker_id": wid,
-                        "cuda_id": cuda_id_list[wid],
-                        "exitcode": p.exitcode,
-                    }
-                )
-
-        all_eval_results: List[Dict[str, Any]] = []
-        errors: List[Dict[str, Any]] = []
-        for wp in worker_paths:
-            if not os.path.exists(wp):
-                print(f"[WARN] Missing worker output: {wp}")
-                continue
-            try:
-                with open(wp, "r", encoding="utf-8") as f:
-                    d = json.load(f)
-                all_eval_results.extend(d.get("results") or [])
-                errors.extend(d.get("errors") or [])
-            except Exception as e:
-                print(f"[WARN] Failed to read {wp}: {e}")
-
-        all_eval_results.sort(key=lambda r: r.get("global_index", 0))
-        errors.sort(key=lambda r: r.get("global_index", 0))
-
-        metrics = compute_multi_if_metrics(all_eval_results)
-        output = {
-            "meta": {
-                "timestamp": timestamp,
-                "model_path": model_path,
-                "cuda_ids": cuda_id_list,
-                "log_dir": resolved_log_dir,
-                "num_workers": num_workers,
-                "num_splits": len(split_names),
-                "splits": split_names,
-                "total_english": total_english,
-                "run_tag": run_tag,
-                "num_beacons_per_segment": num_beacons_per_segment,
-                "num_sinks": num_sinks,
-                "attempted": len(all_eval_results) + len(errors),
-                "succeeded": len(all_eval_results),
-                "failed": len(errors),
-                "worker_outputs": worker_paths,
-                "failed_workers": failed_workers,
-            },
-            "metrics": metrics,
-            "results": all_eval_results,
-            "errors": errors,
-        }
-        write_json_atomic(output_path, output)
-
-        print("\n=== MULTI-IF (ENGLISH) METRICS ===")
-        print(json.dumps(metrics, indent=2, ensure_ascii=False))
-        print(f"\nSaved to: {output_path}")
-        if failed_workers:
-            raise SystemExit(
-                f"{len(failed_workers)}/{num_workers} workers failed; "
-                f"partial results saved to: {output_path}"
-            )
-        return output_path
-
-    # ============================================================
-    # Single GPU / CPU: keep serial evaluation
-    # ============================================================
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_path,
-        trust_remote_code=True,
-        fix_mistral_regex=True,
-    )
-    model, device = load_beacon_model(
-        model_path,
-        device_id=int(cuda_id_list[0]) if cuda_id_list else cuda_id,
-        num_sinks=num_sinks,
-    )
-
-    all_eval_results = []
-    errors = []
-
-    def flush() -> None:
-        metrics = compute_multi_if_metrics(all_eval_results)
-        output = {
-            "meta": {
-                "timestamp": timestamp,
-                "model_path": model_path,
-                "cuda_id": int(cuda_id_list[0]) if cuda_id_list else cuda_id,
-                "log_dir": resolved_log_dir,
-                "num_splits": len(split_names),
-                "splits": split_names,
-                "total_english": total_english,
-                "run_tag": run_tag,
-                "num_beacons_per_segment": num_beacons_per_segment,
-                "num_sinks": num_sinks,
-                "attempted": len(all_eval_results) + len(errors),
-                "succeeded": len(all_eval_results),
-                "failed": len(errors),
-            },
-            "metrics": metrics,
-            "results": all_eval_results,
-            "errors": errors,
-        }
+        # Final update
         try:
-            write_json_atomic(output_path, output)
-        except Exception as e:
-            print(f"[WARN] Failed to write {output_path}: {e}")
-
-    flush()
-
-    pbar = tqdm(total=total_english, desc="Evaluating Multi-IF (English)", unit="sample")
-    try:
-        global_english_idx = 0
-        processed = 0
-        for split in split_names:
-            orig_indices = english_indices_by_split.get(split) or []
-            for en_idx, orig_idx in enumerate(orig_indices):
-                sample = ds[split][orig_idx]
-                pbar.set_postfix(split=split, idx=en_idx)
-                try:
-                    generated_responses = run_multi_if_sample(
-                        sample=sample,
-                        model=model,
-                        tokenizer=tokenizer,
-                        device=device,
-                        verbose=verbose,
-                    )
-                    eval_result = eval_multi_if_sample(
-                        sample=sample,
-                        generated_responses=generated_responses,
-                    )
-                    eval_result["split"] = split
-                    eval_result["index"] = en_idx
-                    eval_result["orig_index"] = orig_idx
-                    eval_result["global_index"] = global_english_idx
-                    all_eval_results.append(eval_result)
-                except Exception as e:
-                    errors.append(
-                        {
-                            "split": split,
-                            "index": en_idx,
-                            "orig_index": orig_idx,
-                            "global_index": global_english_idx,
-                            "key": sample.get("key"),
-                            "error": repr(e),
-                        }
-                    )
-                finally:
-                    global_english_idx += 1
-                    processed += 1
-                    pbar.update(1)
-                    if flush_every > 0 and (processed % flush_every == 0):
-                        flush()
+            with progress_counter.get_lock():
+                current = int(progress_counter.value)
+        except Exception:
+            current = last
+        if current > last:
+            step = min(current - last, total_english - last)
+            if step > 0:
+                pbar.update(step)
+                last += step
     finally:
         pbar.close()
 
-    flush()
+    for p in procs:
+        p.join()
+
+    # Collect results
+    failed_workers = []
+    for wid, p in enumerate(procs):
+        if p.exitcode != 0:
+            failed_workers.append(
+                {
+                    "worker_id": wid,
+                    "exitcode": p.exitcode,
+                }
+            )
+
+    all_eval_results: List[Dict[str, Any]] = []
+    errors: List[Dict[str, Any]] = []
+    
+    for wp in worker_paths:
+        if not os.path.exists(wp):
+            # If a worker didn't process anything (unlikely if N_tasks >> N_workers), it might not create a file?
+            # Actually _run_worker calls flush() at start, so file should exist.
+            print(f"[WARN] Missing worker output: {wp}")
+            continue
+        try:
+            with open(wp, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            all_eval_results.extend(d.get("results") or [])
+            errors.extend(d.get("errors") or [])
+        except Exception as e:
+            print(f"[WARN] Failed to read {wp}: {e}")
+
+    # Deduplication check? No, queue guarantees unique tasks.
+    # Sorting by global index for consistency
+    all_eval_results.sort(key=lambda r: r.get("global_index", 0))
+    errors.sort(key=lambda r: r.get("global_index", 0))
 
     metrics = compute_multi_if_metrics(all_eval_results)
+    output = {
+        "meta": {
+            "timestamp": timestamp,
+            "model_path": model_path,
+            "cuda_ids": cuda_id_list,
+            "log_dir": resolved_log_dir,
+            "num_workers": final_num_workers,
+            "num_splits": len(split_names),
+            "splits": split_names,
+            "total_english": total_english,
+            "run_tag": run_tag,
+            "num_beacons_per_segment": num_beacons_per_segment,
+            "num_sinks": num_sinks,
+            "attempted": len(all_eval_results) + len(errors),
+            "succeeded": len(all_eval_results),
+            "failed": len(errors),
+            "worker_outputs": worker_paths,
+            "failed_workers": failed_workers,
+        },
+        "metrics": metrics,
+        "results": all_eval_results,
+        "errors": errors,
+    }
+    write_json_atomic(output_path, output)
+
     print("\n=== MULTI-IF (ENGLISH) METRICS ===")
     print(json.dumps(metrics, indent=2, ensure_ascii=False))
     print(f"\nSaved to: {output_path}")
-
+    if failed_workers:
+        raise SystemExit(
+            f"{len(failed_workers)}/{final_num_workers} workers failed; "
+            f"partial results saved to: {output_path}"
+        )
     return output_path
 
 
