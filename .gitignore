@@ -14,3 +14,4 @@ train_beacon.sh
 test_attention.py
 /verification
 model_weight
+beacon_baseline
