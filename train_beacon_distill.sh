@@ -12,21 +12,21 @@ cd "$SCRIPT_DIR"
 MODEL_PATH="/data/hkustgz/model_weight/Qwen3-0.6B/"
 TEACHER_MODEL_PATH="/data/hkustgz/model_weight/Qwen3-0.6B/"
 DATA_PATHS="dataset_multiturn_generated.jsonl"
-OUTPUT_DIR="/data/hkustgz/model_weight/32_beacon_0_sink_distill_v2_turn_embedding"
+OUTPUT_DIR="/data/hkustgz/model_weight/8_beacon_0_sink_distill_v2_turn_embedding"
 PROCESSED_CACHE_DIR="./runs/dataset_cache_generated"
 MAX_LENGTH="4096"
-BATCH_SIZE="1"
+BATCH_SIZE="4"
 GRAD_ACCUM="2"
 LEARNING_RATE="1e-4"
 NUM_EPOCHS="16"
 WARMUP_RATIO="0.03"
-SAVE_STEPS="500"
-NUM_BEACONS="32"
+SAVE_STEPS="1000"
+NUM_BEACONS="8"
 NUM_SINKS="0"
 BEACON_RECON_WEIGHT="1.0"
 DISTILL_WEIGHT="1.0"
 CE_WEIGHT="0.0"
-DISTILL_TEMP="2.0"
+DISTILL_TEMP="3.0"
 # 新增参数
 BEACON_ATTN_WEIGHT="0.5"
 MIN_BEACON_ATTN="0.5"
@@ -133,4 +133,4 @@ fi
 
 echo "Training completed!"
 
-bash eval/multi_if/eval_multi_if.sh
+bash eval/eval.sh

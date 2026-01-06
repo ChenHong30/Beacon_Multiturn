@@ -1,11 +1,11 @@
 #!/bin/bash
 
 IS_BEACON=true
-BEACON_MODEL_PATH="/data/hkustgz/model_weight/8_beacon_0_sink_distill_v2_turn_embedding"
+BEACON_MODEL_PATH="/home/hkustgz/Beacon_Multiturn/model_weight/8_beacon_0_sink_distill_v2_turn_embedding/checkpoint-2432"
 BASE_MODEL_PATH="/data/hkustgz/model_weight/Qwen3-0.6B"
 CUDA_ID=0,1,2,3
-LOG_DIR="/home/hkustgz/Beacon_Multiturn/logs/multi_if/8_beacon_128_sink_distill_v2_turn_embedding"
-NUM_SINKS=128
+LOG_DIR="/home/hkustgz/Beacon_Multiturn/logs/multi_if/8_beacon_0_sink_distill_v2_turn_embedding"
+NUM_SINKS=0
 NUM_WORKERS=32
 BEACON_SCRIPT="eval/multi_if/eval_multi_if_beacon.py"
 BASE_SCRIPT="eval/multi_if/eval_multi_if_base.py"

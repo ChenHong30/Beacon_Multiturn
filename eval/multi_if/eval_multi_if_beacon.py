@@ -16,7 +16,7 @@ sys.path.insert(0, PROJECT_ROOT)
 
 import torch
 from datasets import load_dataset
-from transformers import AutoConfig, AutoTokenizer
+from transformers import AutoConfig, AutoTokenizer, set_seed
 
 from tqdm.auto import tqdm
 
@@ -150,7 +150,9 @@ def _run_worker(
     flush_every: int,
     progress_counter: Optional[Any],
     task_queue: Any,
+    seed: int = 42,
 ) -> None:
+    set_seed(seed)
     worker_out = _worker_output_path(log_dir, timestamp, run_tag, worker_id)
 
     # Initialize model
@@ -492,7 +494,9 @@ def main(
     num_sinks: int = 1,
     flush_every: int = 1,
     num_workers: int = 16,
+    seed: int = 42,
 ):
+    set_seed(seed)
     resolved_log_dir = log_dir or os.path.join(PROJECT_ROOT, "logs")
     os.makedirs(resolved_log_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
