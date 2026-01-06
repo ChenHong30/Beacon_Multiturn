@@ -1679,6 +1679,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         enable_beacon_compression: Optional[bool] = True,
+        include_beacon_recon_loss: Optional[bool] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> CausalLMOutputWithPast:
         r"""
@@ -1710,6 +1711,11 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        include_beacon_recon_loss = (
+            bool(getattr(self.config, "include_beacon_recon_loss", True))
+            if include_beacon_recon_loss is None
+            else include_beacon_recon_loss
         )
         
         # 在生成阶段保持beacon压缩启用，以维持压缩的KV缓存
@@ -1748,21 +1754,26 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             if hasattr(outputs, "adjusted_labels"):
                 labels = outputs.adjusted_labels
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
-            beacon_recon_weight = float(getattr(self.config, "beacon_recon_weight", 0.0) or 0.0)
-            if (
-                beacon_recon_weight > 0.0
-                and hasattr(outputs, "beacon_recon_loss")
-                and outputs.beacon_recon_loss is not None
-            ):
-                loss = loss + beacon_recon_weight * outputs.beacon_recon_loss
+            if include_beacon_recon_loss:
+                beacon_recon_weight = float(getattr(self.config, "beacon_recon_weight", 0.0) or 0.0)
+                if (
+                    beacon_recon_weight > 0.0
+                    and hasattr(outputs, "beacon_recon_loss")
+                    and outputs.beacon_recon_loss is not None
+                ):
+                    loss = loss + beacon_recon_weight * outputs.beacon_recon_loss
 
-        return CausalLMOutputWithPast(
+        output = CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+        if hasattr(outputs, "beacon_recon_loss"):
+            output.beacon_recon_loss = outputs.beacon_recon_loss
+
+        return output
 
 
 class Qwen3ForSequenceClassification(GenericForSequenceClassification, Qwen3PreTrainedModel):

@@ -858,6 +858,7 @@ class DistillTrainer(Trainer):
             labels=labels,
             use_cache=False,
             enable_beacon_compression=True,
+            include_beacon_recon_loss=False,
             output_attentions=need_attentions,
             output_hidden_states=need_hidden_states,
         )
@@ -881,6 +882,13 @@ class DistillTrainer(Trainer):
             loss = loss + self.distill_weight * kd_loss
         if self.ce_weight > 0.0 and ce_loss is not None:
             loss = loss + self.ce_weight * ce_loss
+        beacon_recon_weight = float(getattr(student_model.config, "beacon_recon_weight", 0.0) or 0.0)
+        if (
+            beacon_recon_weight > 0.0
+            and hasattr(student_outputs, "beacon_recon_loss")
+            and student_outputs.beacon_recon_loss is not None
+        ):
+            loss = loss + beacon_recon_weight * student_outputs.beacon_recon_loss
 
         # 方案1: Beacon注意力正则化
         if self.beacon_attn_weight > 0.0 and student_attentions is not None:
