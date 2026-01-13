@@ -164,7 +164,7 @@ def main() -> None:
     parser.add_argument("--log", required=True, help="Path to the evaluation log (.json or .jsonl).")
     parser.add_argument(
         "--tokenizer-model",
-        default="/data/hkustgz/model_weight/16_beacon_4_sink",
+        default="/data/hkustgz/model_weight/8_beacon_0_sink_distill_v2",
         help="Tokenizer/model path for token counting.",
     )
     parser.add_argument(
