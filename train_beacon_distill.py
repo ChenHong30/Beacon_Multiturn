@@ -172,6 +172,24 @@ def parse_args() -> argparse.Namespace:
         help="Minimum attention ratio to beacons (for beacon attention regularization).",
     )
     parser.add_argument(
+        "--attn-guided-distill-weight",
+        type=float,
+        default=0.0,
+        help="Weight for attention-guided distillation loss. When > 0, uses teacher's attention patterns to weight the KD loss.",
+    )
+    parser.add_argument(
+        "--attn-guided-layers",
+        type=str,
+        default="-1",
+        help="Which layers' attention to use for guiding distillation (comma-separated, e.g., '-1' or '20,21,22').",
+    )
+    parser.add_argument(
+        "--attn-guided-temperature",
+        type=float,
+        default=1.0,
+        help="Temperature for sharpening the attention-based importance weights. Lower = sharper focus on high-attention positions.",
+    )
+    parser.add_argument(
         "--resume-from-checkpoint",
         type=str,
         default=None,
@@ -560,6 +578,9 @@ class DistillTrainer(Trainer):
         hidden_distill_weight: float = 0.0,
         hidden_distill_layer: int = -1,
         min_beacon_attn: float = 0.1,
+        attn_guided_distill_weight: float = 0.0,
+        attn_guided_layers: str = "-1",
+        attn_guided_temperature: float = 1.0,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -571,6 +592,10 @@ class DistillTrainer(Trainer):
         self.hidden_distill_weight = hidden_distill_weight
         self.hidden_distill_layer = hidden_distill_layer
         self.min_beacon_attn = min_beacon_attn
+        self.attn_guided_distill_weight = attn_guided_distill_weight
+        # 解析层索引，支持 "-1" 或 "20,21,22" 格式
+        self.attn_guided_layers = [int(x.strip()) for x in attn_guided_layers.split(",")]
+        self.attn_guided_temperature = attn_guided_temperature
         self.kl_loss = torch.nn.KLDivLoss(reduction="batchmean")
 
     @staticmethod
@@ -832,13 +857,162 @@ class DistillTrainer(Trainer):
 
         return total_loss
 
+    def _compute_attention_guided_kd_loss(
+        self,
+        student_model: torch.nn.Module,
+        input_ids: torch.Tensor,
+        labels: Optional[torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+        student_logits: torch.Tensor,
+        teacher_logits: torch.Tensor,
+        teacher_attentions: tuple,
+    ) -> torch.Tensor:
+        """
+        计算注意力引导的蒸馏损失。
+        
+        核心思想：Teacher 在生成回复时会 attend 到历史中的部分关键位置。
+        这些被高度关注的位置才是 beacon 应该精确压缩的信息。
+        使用 teacher 的 attention 分布作为权重，对每个位置的蒸馏 loss 进行加权。
+        
+        Args:
+            student_model: 学生模型（带beacon压缩）
+            input_ids: 原始输入（未添加beacon）
+            labels: 标签
+            attention_mask: 注意力mask
+            student_logits: 学生模型的logits [B, student_seq_len, vocab_size]
+            teacher_logits: 教师模型的logits [B, teacher_seq_len, vocab_size]
+            teacher_attentions: 教师模型各层的attention weights
+        
+        Returns:
+            attention_guided_kd_loss: 加权后的蒸馏损失
+        """
+        if teacher_attentions is None or len(teacher_attentions) == 0:
+            return student_logits.new_tensor(0.0)
+
+        # 解析学生模型的对话结构，获取beacon位置和映射关系
+        student_seq_len = student_logits.shape[1]
+        distill_mask, mapping = self._build_distill_mask(
+            student_model=student_model,
+            input_ids=input_ids,
+            labels=labels,
+            attention_mask=attention_mask,
+            student_seq_len=student_seq_len,
+        )
+
+        if distill_mask.sum().item() == 0:
+            return student_logits.new_tensor(0.0)
+
+        batch_size = input_ids.shape[0]
+        teacher_seq_len = teacher_logits.shape[1]
+        vocab_size = student_logits.shape[-1]
+
+        # 1. 从 teacher 的 attention 中提取位置重要性
+        # 选择指定层的 attention（默认使用最后一层或多层平均）
+        selected_attentions = []
+        num_layers = len(teacher_attentions)
+        for layer_idx in self.attn_guided_layers:
+            actual_idx = layer_idx if layer_idx >= 0 else num_layers + layer_idx
+            if 0 <= actual_idx < num_layers:
+                selected_attentions.append(teacher_attentions[actual_idx])
+        
+        if len(selected_attentions) == 0:
+            return student_logits.new_tensor(0.0)
+        
+        # 平均多层的 attention [B, num_heads, seq_len, seq_len]
+        avg_attention = torch.stack(selected_attentions, dim=0).mean(dim=0)
+        # 平均所有头 [B, seq_len, seq_len]
+        avg_attention = avg_attention.mean(dim=1)
+
+        # 2. 计算每个历史位置的"重要性"
+        # 对于每个当前轮次的位置，计算它对历史位置的 attention 总和
+        # 找到当前轮次的起始位置（有label的区域）
+        position_importance = torch.zeros(batch_size, teacher_seq_len, device=input_ids.device, dtype=avg_attention.dtype)
+        
+        for b in range(batch_size):
+            # 找到当前轮次（有label的位置）
+            if labels is not None:
+                current_positions = (labels[b] != -100).nonzero(as_tuple=True)[0]
+                if len(current_positions) == 0:
+                    continue
+                current_start = current_positions[0].item()
+                current_end = min(current_positions[-1].item() + 1, teacher_seq_len)
+            else:
+                # 如果没有labels，使用最后1/3序列作为当前轮次
+                current_start = teacher_seq_len * 2 // 3
+                current_end = teacher_seq_len
+            
+            # 当前轮次tokens对历史位置的attention分布
+            # current_to_history_attn: [current_len, history_len]
+            history_end = current_start
+            if history_end <= 0:
+                continue
+                
+            current_to_history_attn = avg_attention[b, current_start:current_end, :history_end]
+            
+            # 计算每个历史位置被当前轮次attend的总程度
+            # 对当前轮次的所有位置求和 [history_len]
+            history_importance = current_to_history_attn.sum(dim=0)
+            
+            # 应用温度进行锐化/平滑
+            if self.attn_guided_temperature != 1.0:
+                history_importance = history_importance / self.attn_guided_temperature
+                history_importance = F.softmax(history_importance, dim=-1) * history_importance.sum()
+            
+            position_importance[b, :history_end] = history_importance
+
+        # 3. 归一化重要性分数（避免scale问题）
+        # 对每个batch归一化到[0, 1]区间，并加上一个基础权重（避免完全忽略某些位置）
+        min_weight = 0.1  # 最小权重，确保不会完全忽略任何位置
+        for b in range(batch_size):
+            imp = position_importance[b]
+            if imp.max() > 0:
+                # 归一化到 [0, 1]
+                imp = (imp - imp.min()) / (imp.max() - imp.min() + 1e-8)
+                # 缩放到 [min_weight, 1]
+                position_importance[b] = imp * (1 - min_weight) + min_weight
+
+        # 4. 计算加权的KD loss
+        # 建立学生位置到教师位置的映射
+        student_flat = student_logits.view(-1, vocab_size)
+        flat_mask = distill_mask.view(-1)
+        mapping_flat = mapping.view(-1)[flat_mask]
+
+        valid = mapping_flat >= 0
+        if not valid.any():
+            return student_logits.new_tensor(0.0)
+
+        student_sel = student_flat[flat_mask][valid]
+        
+        # 获取对应的教师logits
+        batch_ids = torch.arange(batch_size, device=teacher_logits.device).unsqueeze(1)
+        batch_ids = batch_ids.expand(batch_size, student_seq_len).reshape(-1)
+        teacher_sel = teacher_logits[batch_ids[flat_mask][valid], mapping_flat[valid]]
+
+        # 获取对应位置的重要性权重
+        importance_weights = position_importance[batch_ids[flat_mask][valid], mapping_flat[valid]]
+
+        # 计算每个位置的KD loss
+        temperature = max(self.temperature, 1e-5)
+        student_log_probs = F.log_softmax(student_sel.float() / temperature, dim=-1)
+        teacher_probs = F.softmax(teacher_sel.float() / temperature, dim=-1)
+        
+        # 逐位置计算KL散度
+        per_position_kd = F.kl_div(student_log_probs, teacher_probs, reduction='none').sum(dim=-1)
+        
+        # 用重要性权重加权
+        weighted_kd_loss = (importance_weights * per_position_kd).sum() / (importance_weights.sum() + 1e-8)
+        weighted_kd_loss = weighted_kd_loss * (temperature * temperature)
+
+        return weighted_kd_loss
+
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         input_ids = inputs.get("input_ids")
         attention_mask = inputs.get("attention_mask")
         labels = inputs.get("labels")
 
         # 判断是否需要额外输出
-        need_attentions = self.beacon_attn_weight > 0.0
+        need_student_attentions = self.beacon_attn_weight > 0.0
+        need_teacher_attentions = self.attn_guided_distill_weight > 0.0
         need_hidden_states = self.hidden_distill_weight > 0.0
 
         with torch.no_grad():
@@ -848,9 +1022,11 @@ class DistillTrainer(Trainer):
                 use_cache=False,
                 enable_beacon_compression=False,
                 output_hidden_states=need_hidden_states,
+                output_attentions=need_teacher_attentions,
             )
             teacher_logits = teacher_outputs.logits
             teacher_hidden_states = teacher_outputs.hidden_states if need_hidden_states else None
+            teacher_attentions = teacher_outputs.attentions if need_teacher_attentions else None
 
         student_outputs = model(
             input_ids=input_ids,
@@ -859,12 +1035,12 @@ class DistillTrainer(Trainer):
             use_cache=False,
             enable_beacon_compression=True,
             include_beacon_recon_loss=False,
-            output_attentions=need_attentions,
+            output_attentions=need_student_attentions,
             output_hidden_states=need_hidden_states,
         )
         student_logits = student_outputs.logits
         ce_loss = student_outputs.loss if labels is not None else None
-        student_attentions = student_outputs.attentions if need_attentions else None
+        student_attentions = student_outputs.attentions if need_student_attentions else None
         student_hidden_states = student_outputs.hidden_states if need_hidden_states else None
 
         student_model = self._unwrap_model(model)
@@ -899,6 +1075,19 @@ class DistillTrainer(Trainer):
                 attentions=student_attentions,
             )
             loss = loss + self.beacon_attn_weight * beacon_attn_loss
+
+        # 方案2: 注意力引导的蒸馏 (Attention-Guided Beacon Distillation)
+        if self.attn_guided_distill_weight > 0.0 and teacher_attentions is not None:
+            attn_guided_kd_loss = self._compute_attention_guided_kd_loss(
+                student_model=student_model,
+                input_ids=input_ids,
+                labels=labels,
+                attention_mask=attention_mask,
+                student_logits=student_logits,
+                teacher_logits=teacher_logits,
+                teacher_attentions=teacher_attentions,
+            )
+            loss = loss + self.attn_guided_distill_weight * attn_guided_kd_loss
 
         # 方案3: Hidden states蒸馏
         if self.hidden_distill_weight > 0.0 and student_hidden_states is not None and teacher_hidden_states is not None:
@@ -1091,6 +1280,9 @@ def main() -> None:
             hidden_distill_weight=args.hidden_distill_weight,
             hidden_distill_layer=args.hidden_distill_layer,
             min_beacon_attn=args.min_beacon_attn,
+            attn_guided_distill_weight=args.attn_guided_distill_weight,
+            attn_guided_layers=args.attn_guided_layers,
+            attn_guided_temperature=args.attn_guided_temperature,
         )
 
         if args.resume_from_checkpoint is not None:

@@ -12,7 +12,7 @@ cd "$SCRIPT_DIR"
 MODEL_PATH="/data/hkustgz/model_weight/Qwen3-0.6B/"
 TEACHER_MODEL_PATH="/data/hkustgz/model_weight/Qwen3-0.6B/"
 DATA_PATHS="dataset_multiturn_generated.jsonl"
-OUTPUT_DIR="/data/hkustgz/model_weight/8_beacon_0_sink_distill_v2"
+OUTPUT_DIR="/data/hkustgz/model_weight/8_beacon_0_sink_distill_v2_attn_guided"
 PROCESSED_CACHE_DIR="./runs/dataset_cache_generated"
 MAX_LENGTH="4096"
 BATCH_SIZE="4"
@@ -32,6 +32,10 @@ BEACON_ATTN_WEIGHT="0.5"
 MIN_BEACON_ATTN="0.1"
 HIDDEN_DISTILL_WEIGHT="0.5"
 HIDDEN_DISTILL_LAYER="-1"
+# 注意力引导蒸馏参数
+ATTN_GUIDED_DISTILL_WEIGHT="0.5"
+ATTN_GUIDED_LAYERS="-1"
+ATTN_GUIDED_TEMPERATURE="3.0"
 
 
 if [ -z "$CUDA_VISIBLE_DEVICES" ]; then
@@ -65,6 +69,9 @@ echo "Beacon attn weight: $BEACON_ATTN_WEIGHT"
 echo "Hidden distill weight: $HIDDEN_DISTILL_WEIGHT"
 echo "Hidden distill layer: $HIDDEN_DISTILL_LAYER"
 echo "Min beacon attn: $MIN_BEACON_ATTN"
+echo "Attn guided distill weight: $ATTN_GUIDED_DISTILL_WEIGHT"
+echo "Attn guided layers: $ATTN_GUIDED_LAYERS"
+echo "Attn guided temperature: $ATTN_GUIDED_TEMPERATURE"
 echo "========================================"
 
 if [ "$N_GPUS" -gt 1 ]; then
@@ -95,6 +102,9 @@ if [ "$N_GPUS" -gt 1 ]; then
         --hidden-distill-weight $HIDDEN_DISTILL_WEIGHT \
         --hidden-distill-layer $HIDDEN_DISTILL_LAYER \
         --min-beacon-attn $MIN_BEACON_ATTN \
+        --attn-guided-distill-weight $ATTN_GUIDED_DISTILL_WEIGHT \
+        --attn-guided-layers "$ATTN_GUIDED_LAYERS" \
+        --attn-guided-temperature $ATTN_GUIDED_TEMPERATURE \
         --bf16 \
         --train-beacon-only \
         --gradient-checkpointing \
@@ -124,6 +134,9 @@ else
         --hidden-distill-weight $HIDDEN_DISTILL_WEIGHT \
         --hidden-distill-layer $HIDDEN_DISTILL_LAYER \
         --min-beacon-attn $MIN_BEACON_ATTN \
+        --attn-guided-distill-weight $ATTN_GUIDED_DISTILL_WEIGHT \
+        --attn-guided-layers "$ATTN_GUIDED_LAYERS" \
+        --attn-guided-temperature $ATTN_GUIDED_TEMPERATURE \
         --bf16 \
         --train-beacon-only \
         --train-lm-head \
