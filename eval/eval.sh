@@ -3,7 +3,7 @@
 
 # ------------------------------------------------------------------------------------------
 # Basic Configuration
-BEACON_MODEL_PATH="/home/hkustgz/Beacon_Multiturn/model_weight/8_beacon_0_sink_distill_v2_turn_embedding/checkpoint-1000"
+BEACON_MODEL_PATH="/data/hkustgz/model_weight/8_beacon_0_sink_distill_v2"
 BASE_MODEL_PATH="/data/hkustgz/model_weight/Qwen3-0.6B"
 CUDA_ID=0,1,2,3 # Comma-separated CUDA device IDs
 TASK_TYPE="multi_if" # Options: multi_if, mtbench_101, gsm8k
