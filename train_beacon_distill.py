@@ -115,7 +115,14 @@ def parse_args() -> argparse.Namespace:
         "--num-beacons",
         type=int,
         default=16,
-        help="Number of beacon tokens inserted per historical segment.",
+        help="Default number of beacon tokens inserted per historical segment (used for inference).",
+    )
+    parser.add_argument(
+        "--max-beacon-num",
+        type=int,
+        default=None,
+        help="Maximum beacon number for dynamic beacon training. If set, training will randomly sample "
+             "beacon count from 1 to max-beacon-num for each sample. If None, uses fixed num-beacons.",
     )
     parser.add_argument(
         "--num-sinks",
@@ -581,6 +588,8 @@ class DistillTrainer(Trainer):
         attn_guided_distill_weight: float = 0.0,
         attn_guided_layers: str = "-1",
         attn_guided_temperature: float = 1.0,
+        max_beacon_num: Optional[int] = None,
+        default_num_beacons: int = 16,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -597,6 +606,10 @@ class DistillTrainer(Trainer):
         self.attn_guided_layers = [int(x.strip()) for x in attn_guided_layers.split(",")]
         self.attn_guided_temperature = attn_guided_temperature
         self.kl_loss = torch.nn.KLDivLoss(reduction="batchmean")
+        # 动态beacon数量训练参数
+        self.max_beacon_num = max_beacon_num
+        self.default_num_beacons = default_num_beacons
+        self.dynamic_beacon_enabled = max_beacon_num is not None and max_beacon_num > 1
 
     @staticmethod
     def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
@@ -609,9 +622,12 @@ class DistillTrainer(Trainer):
         labels: Optional[torch.Tensor],
         attention_mask: Optional[torch.Tensor],
         student_seq_len: int,
+        num_beacons: Optional[int] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         with torch.no_grad():
-            _, modified_input_ids, _, _, _ = student_model.model.parse_multiturn_dialogue(input_ids, labels)
+            _, modified_input_ids, _, _, _ = student_model.model.parse_multiturn_dialogue(
+                input_ids, labels, num_beacons=num_beacons
+            )
 
         if modified_input_ids.shape[1] != student_seq_len:
             modified_input_ids = modified_input_ids[:, :student_seq_len]
@@ -662,6 +678,7 @@ class DistillTrainer(Trainer):
         attention_mask: Optional[torch.Tensor],
         student_logits: torch.Tensor,
         teacher_logits: torch.Tensor,
+        num_beacons: Optional[int] = None,
     ) -> torch.Tensor:
         student_seq_len = student_logits.shape[1]
         distill_mask, mapping = self._build_distill_mask(
@@ -670,6 +687,7 @@ class DistillTrainer(Trainer):
             labels=labels,
             attention_mask=attention_mask,
             student_seq_len=student_seq_len,
+            num_beacons=num_beacons,
         )
 
         if distill_mask.sum().item() == 0:
@@ -731,12 +749,14 @@ class DistillTrainer(Trainer):
                 continue
 
             # 当前轮次是最后一个segment
+            # qa_segments格式: (start, end, num_beacons)
             current_start = bounds[-1][0]
             current_end = bounds[-1][1]
-            
+
             # 历史beacon位置（不包括当前轮次的beacons，如果有的话）
             history_beacon_indices = []
-            for seg_idx, (start, end) in enumerate(bounds[:-1]):
+            for seg_idx, segment_info in enumerate(bounds[:-1]):
+                start, end, _ = segment_info  # 解包三元组
                 seg_beacon_mask = beacon_mask[b, start:end]
                 seg_beacon_positions = torch.where(seg_beacon_mask)[0] + start
                 history_beacon_indices.extend(seg_beacon_positions.tolist())
@@ -866,14 +886,15 @@ class DistillTrainer(Trainer):
         student_logits: torch.Tensor,
         teacher_logits: torch.Tensor,
         teacher_attentions: tuple,
+        num_beacons: Optional[int] = None,
     ) -> torch.Tensor:
         """
         计算注意力引导的蒸馏损失。
-        
+
         核心思想：Teacher 在生成回复时会 attend 到历史中的部分关键位置。
         这些被高度关注的位置才是 beacon 应该精确压缩的信息。
         使用 teacher 的 attention 分布作为权重，对每个位置的蒸馏 loss 进行加权。
-        
+
         Args:
             student_model: 学生模型（带beacon压缩）
             input_ids: 原始输入（未添加beacon）
@@ -882,7 +903,8 @@ class DistillTrainer(Trainer):
             student_logits: 学生模型的logits [B, student_seq_len, vocab_size]
             teacher_logits: 教师模型的logits [B, teacher_seq_len, vocab_size]
             teacher_attentions: 教师模型各层的attention weights
-        
+            num_beacons: 每个历史消息使用的beacon数量
+
         Returns:
             attention_guided_kd_loss: 加权后的蒸馏损失
         """
@@ -897,6 +919,7 @@ class DistillTrainer(Trainer):
             labels=labels,
             attention_mask=attention_mask,
             student_seq_len=student_seq_len,
+            num_beacons=num_beacons,
         )
 
         if distill_mask.sum().item() == 0:
@@ -1010,6 +1033,15 @@ class DistillTrainer(Trainer):
         attention_mask = inputs.get("attention_mask")
         labels = inputs.get("labels")
 
+        # 动态beacon数量采样：每个batch随机选择beacon数量
+        if self.dynamic_beacon_enabled:
+            # 样本级别抽样：整个batch使用相同的beacon数量
+            # 从1到max_beacon_num均匀采样
+            num_beacons = np.random.randint(1, self.max_beacon_num + 1)
+        else:
+            # 使用固定的beacon数量（None表示使用模型配置的默认值）
+            num_beacons = None
+
         # 判断是否需要额外输出
         need_student_attentions = self.beacon_attn_weight > 0.0
         need_teacher_attentions = self.attn_guided_distill_weight > 0.0
@@ -1037,6 +1069,7 @@ class DistillTrainer(Trainer):
             include_beacon_recon_loss=False,
             output_attentions=need_student_attentions,
             output_hidden_states=need_hidden_states,
+            num_beacons=num_beacons,
         )
         student_logits = student_outputs.logits
         ce_loss = student_outputs.loss if labels is not None else None
@@ -1051,6 +1084,7 @@ class DistillTrainer(Trainer):
             attention_mask=attention_mask,
             student_logits=student_logits,
             teacher_logits=teacher_logits,
+            num_beacons=num_beacons,
         )
 
         loss = student_logits.new_tensor(0.0)
@@ -1086,6 +1120,7 @@ class DistillTrainer(Trainer):
                 student_logits=student_logits,
                 teacher_logits=teacher_logits,
                 teacher_attentions=teacher_attentions,
+                num_beacons=num_beacons,
             )
             loss = loss + self.attn_guided_distill_weight * attn_guided_kd_loss
 
@@ -1163,6 +1198,11 @@ def main() -> None:
         config.num_beacons_per_segment = args.num_beacons
         config.num_sinks = args.num_sinks
         config.beacon_recon_weight = float(args.beacon_recon_weight)
+        # 设置max_beacon_num：如果指定则使用指定值，否则使用num_beacons作为默认
+        if args.max_beacon_num is not None:
+            config.max_beacon_num = args.max_beacon_num
+        else:
+            config.max_beacon_num = args.num_beacons
 
         model_cls = Qwen3ForCausalLM
         dtype = torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else None)
@@ -1283,6 +1323,8 @@ def main() -> None:
             attn_guided_distill_weight=args.attn_guided_distill_weight,
             attn_guided_layers=args.attn_guided_layers,
             attn_guided_temperature=args.attn_guided_temperature,
+            max_beacon_num=args.max_beacon_num,
+            default_num_beacons=args.num_beacons,
         )
 
         if args.resume_from_checkpoint is not None:

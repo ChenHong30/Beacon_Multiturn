@@ -12,7 +12,7 @@ cd "$SCRIPT_DIR"
 MODEL_PATH="/data/hkustgz/model_weight/Qwen3-0.6B/"
 TEACHER_MODEL_PATH="/data/hkustgz/model_weight/Qwen3-0.6B/"
 DATA_PATHS="dataset_multiturn_generated.jsonl"
-OUTPUT_DIR="/data/hkustgz/model_weight/8_beacon_0_sink_distill_v2_attn_guided"
+OUTPUT_DIR="/data/hkustgz/model_weight/beacon-0.6B-dynamic"
 PROCESSED_CACHE_DIR="./runs/dataset_cache_generated"
 MAX_LENGTH="4096"
 BATCH_SIZE="4"
@@ -22,6 +22,7 @@ NUM_EPOCHS="16"
 WARMUP_RATIO="0.03"
 SAVE_STEPS="1000"
 NUM_BEACONS="8"
+MAX_BEACON_NUM="64"  # 动态beacon训练：训练时从1到128随机采样beacon数量
 NUM_SINKS="0"
 BEACON_RECON_WEIGHT="1.0"
 DISTILL_WEIGHT="1.0"
@@ -60,6 +61,7 @@ echo "Learning rate: $LEARNING_RATE"
 echo "Warmup ratio: $WARMUP_RATIO"
 echo "Epochs: $NUM_EPOCHS"
 echo "Num beacons: $NUM_BEACONS"
+echo "Max beacon num: $MAX_BEACON_NUM"
 echo "Num sinks: $NUM_SINKS"
 echo "Beacon recon weight: $BEACON_RECON_WEIGHT"
 echo "Distill weight: $DISTILL_WEIGHT"
@@ -93,6 +95,7 @@ if [ "$N_GPUS" -gt 1 ]; then
         --num-epochs $NUM_EPOCHS \
         --save-steps $SAVE_STEPS \
         --num-beacons $NUM_BEACONS \
+        --max-beacon-num $MAX_BEACON_NUM \
         --num-sinks $NUM_SINKS \
         --beacon-recon-weight $BEACON_RECON_WEIGHT \
         --distill-weight $DISTILL_WEIGHT \
@@ -125,6 +128,7 @@ else
         --num-epochs $NUM_EPOCHS \
         --save-steps $SAVE_STEPS \
         --num-beacons $NUM_BEACONS \
+        --max-beacon-num $MAX_BEACON_NUM \
         --num-sinks $NUM_SINKS \
         --beacon-recon-weight $BEACON_RECON_WEIGHT \
         --distill-weight $DISTILL_WEIGHT \

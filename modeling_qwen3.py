@@ -618,17 +618,27 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
         # === Beacons 增强：Learnable Position Embedding ===
         # 每个 beacon 位置有独立的可学习 embedding，帮助模型区分不同 beacons 的角色
-        # 从 config 读取 beacon 数量
+
+        # max_beacon_num: beacon位置编码的最大容量，支持动态beacon数量
+        # 训练时每个样本可以随机选择1到max_beacon_num之间的beacon数量
+        self.max_beacon_num = getattr(config, 'max_beacon_num', 128)
+
+        # num_beacons_per_segment: 默认的beacon数量（推理时如果不指定就用这个）
         self.num_beacons_per_segment = getattr(config, 'num_beacons_per_segment', 16)
-        # 如果config中没有设置，且getattr默认值也未生效(理论上不会)，则报错
         if self.num_beacons_per_segment is None:
-            raise ValueError("num_beacons_per_segment must be specified in config")
+            self.num_beacons_per_segment = 16
+
+        # 确保默认值不超过最大容量
+        if self.num_beacons_per_segment > self.max_beacon_num:
+            self.num_beacons_per_segment = self.max_beacon_num
 
         # 从 config 读取 sink token 数量（每轮次保留的头部token数）
         self.num_sinks = getattr(config, 'num_sinks', 4)
 
+        # beacon_position_embedding 的大小基于 max_beacon_num
+        # 实际使用时根据当前 num_beacons 取前 n 个
         self.beacon_position_embedding = nn.Parameter(
-            torch.zeros(self.num_beacons_per_segment, config.hidden_size)
+            torch.zeros(self.max_beacon_num, config.hidden_size)
         )
 
         # === Beacon 轮次编码 (Turn Encoding) ===
@@ -702,7 +712,8 @@ class Qwen3Model(Qwen3PreTrainedModel):
         self.embed_tokens = value
 
     def parse_multiturn_dialogue(
-        self, input_ids: torch.Tensor, labels: Optional[torch.Tensor] = None
+        self, input_ids: torch.Tensor, labels: Optional[torch.Tensor] = None,
+        num_beacons: Optional[int] = None
     ) -> tuple[list, torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
         """
         解析多轮对话序列，识别每个QA轮次，并在每个历史轮次末尾添加beacon token
@@ -715,15 +726,26 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
         例如：System + U1 + A1 + U2 + A2 + U3 (当前问题)
         会变成：System + [B_U1] + [B_A1] + [B_U2] + [B_A2] + U3
-        其中 [B_U1] 表示 U1 的 beacon 序列 (长度为 num_beacons_per_segment)
+        其中 [B_U1] 表示 U1 的 beacon 序列 (长度为 num_beacons)
+
+        Args:
+            input_ids: 输入token ids
+            labels: 标签（可选）
+            num_beacons: 每个历史消息使用的beacon数量，如果为None则使用默认值
 
         Returns:
-            qa_segments: 每个QA轮次的起始和结束位置列表
+            qa_segments: 每个历史消息的 (起始位置, 最后beacon位置, beacon数量) 列表
             modified_input_ids: 添加了beacon token的input_ids
             beacon_positions: beacon token的位置mask
             modified_labels: 若提供labels，则返回与modified_input_ids对齐的labels（beacon位置填充为-100）
             beacon_turn_ids: 每个位置对应的轮次ID（非beacon位置为-1）
         """
+        # 确定本次使用的beacon数量
+        if num_beacons is None:
+            num_beacons = self.num_beacons_per_segment
+        # 确保不超过最大容量
+        num_beacons = min(num_beacons, self.max_beacon_num)
+        num_beacons = max(num_beacons, 1)  # 最少1个beacon
         batch_size, seq_len = input_ids.shape
         qa_segments = []
         modified_input_ids_list = []
@@ -831,16 +853,16 @@ class Qwen3Model(Qwen3PreTrainedModel):
                     current_turn_id = message_to_turn.get(i, 0)
                     # 限制轮次ID不超过max_turns
                     current_turn_id = min(current_turn_id, self.max_turns - 1)
-                    
-                    # Insert beacon tokens (数量由 config 指定)
-                    for beacon_idx in range(self.num_beacons_per_segment):
+
+                    # Insert beacon tokens (数量由 num_beacons 参数指定)
+                    for beacon_idx in range(num_beacons):
                         modified_ids.append(self.beacon_token_id)
                         beacon_pos.append(1)  # 标记这是beacon token位置
                         beacon_turns.append(current_turn_id)  # 记录轮次ID
                         if labels is not None and modified_label_ids is not None:
                             # 最后一个beacon预测下一个token（通常是<|im_start|>）
                             # 其他beacon位置不参与loss
-                            if beacon_idx == self.num_beacons_per_segment - 1:
+                            if beacon_idx == num_beacons - 1:
                                 # 获取segment后的下一个token作为预测目标
                                 next_token_pos = end_pos + 1
                                 if next_token_pos < len(ids):
@@ -850,9 +872,9 @@ class Qwen3Model(Qwen3PreTrainedModel):
                             else:
                                 modified_label_ids.append(-100)  # 非最后beacon不参与loss
 
-                    # 记录 (段落在modified中的起始位置, beacon在modified中的位置)
-                    # 指向这一批beacons的最后一个
-                    segments.append((segment_start_in_modified, len(modified_ids) - 1))
+                    # 记录 (段落在modified中的起始位置, beacon在modified中的位置, beacon数量)
+                    # 第三个元素记录该segment使用的beacon数量，供后续mask构建和KV压缩使用
+                    segments.append((segment_start_in_modified, len(modified_ids) - 1, num_beacons))
 
                 current_pos = end_pos + 1
 
@@ -990,11 +1012,13 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 segment_indices_list = [system_indices]
 
                 if qa_segments is not None and len(qa_segments) > b:
-                    for seg_idx, (seg_start, seg_end) in enumerate(qa_segments[b]):
+                    for seg_idx, segment_info in enumerate(qa_segments[b]):
+                        # qa_segments格式: (seg_start, seg_end, seg_num_beacons)
+                        seg_start, seg_end, seg_num_beacons = segment_info
                         # seg_start: 段落开始位置
                         # seg_end: 最后一个beacon的位置
-                        # 第一个beacon的位置: seg_end - (num_beacons_per_segment - 1)
-                        first_beacon_pos = seg_end - (self.num_beacons_per_segment - 1)
+                        # 第一个beacon的位置: seg_end - (seg_num_beacons - 1)
+                        first_beacon_pos = seg_end - (seg_num_beacons - 1)
 
                         # Sink tokens: 段落开头的num_sinks个token
                         sink_end = min(seg_start + self.num_sinks, first_beacon_pos)
@@ -1101,6 +1125,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         enable_beacon_compression: Optional[bool] = True,
+        num_beacons: Optional[int] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithPast:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -1131,8 +1156,9 @@ class Qwen3Model(Qwen3PreTrainedModel):
         beacon_turn_ids = None  # 初始化轮次ID
         if (input_ids is not None and enable_beacon_compression and is_prefill):
             # 解析多轮对话并添加beacon token
+            # num_beacons 参数控制每个历史消息使用的beacon数量
             qa_segments, modified_input_ids, beacon_positions, modified_labels, beacon_turn_ids = self.parse_multiturn_dialogue(
-                input_ids, labels
+                input_ids, labels, num_beacons=num_beacons
             )
 
             # 如果检测到多轮对话，使用修改后的input_ids
@@ -1170,19 +1196,26 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 for b in range(batch_size):
                     beacon_indices = torch.nonzero(beacon_mask[b], as_tuple=False).squeeze(-1)
                     if beacon_indices.numel() > 0:
-                        # 每 num_beacons_per_segment 个 beacons 为一组（对应一个 segment）
+                        # 从qa_segments获取该样本的beacon数量
+                        # qa_segments格式: [(start, end, num_beacons), ...]
+                        current_num_beacons = self.num_beacons_per_segment  # 默认值
+                        if qa_segments is not None and len(qa_segments) > b and len(qa_segments[b]) > 0:
+                            # 由于样本级别抽样，所有segment使用相同beacon数量，取第一个即可
+                            current_num_beacons = qa_segments[b][0][2]
+
+                        # 每 current_num_beacons 个 beacons 为一组（对应一个 segment）
                         for i, idx in enumerate(beacon_indices.tolist()):
-                            pos_in_segment = i % self.num_beacons_per_segment
+                            pos_in_segment = i % current_num_beacons
                             # 获取轮次ID（如果可用）
                             if beacon_turn_ids is not None:
                                 turn_id = beacon_turn_ids[b, idx].item()
                                 turn_id = max(0, min(turn_id, self.max_turns - 1))  # 确保在有效范围内
                             else:
                                 # 后备方案：根据beacon组计算轮次
-                                turn_id = min(i // self.num_beacons_per_segment, self.max_turns - 1)
+                                turn_id = min(i // current_num_beacons, self.max_turns - 1)
                             # 基础 embedding + 位置 embedding + 轮次 embedding
                             inputs_embeds[b, idx] = (
-                                self.beacon_embedding + 
+                                self.beacon_embedding +
                                 self.beacon_position_embedding[pos_in_segment] +
                                 self.beacon_turn_embedding[turn_id]
                             )
@@ -1259,16 +1292,19 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 causal_mask_mapping["full_attention"] = current_mask
 
             for b, segments in enumerate(qa_segments):
-                for (start_i, end_i) in segments:
+                for segment_info in segments:
+                    # qa_segments格式: (start_i, end_i, seg_num_beacons)
+                    start_i, end_i, seg_num_beacons = segment_info
                     # start_i: 段落开始
                     # end_i: 最后一个 beacon 的位置
-                    # 第一个 beacon 的位置: end_i - (num_beacons_per_segment - 1)
+                    # seg_num_beacons: 该segment使用的beacon数量
+                    # 第一个 beacon 的位置: end_i - (seg_num_beacons - 1)
                     # Body 范围: [start_i, first_beacon) (不包含 beacons)
 
-                    first_beacon = end_i - (self.num_beacons_per_segment - 1)  # 第一个 beacon 的位置
+                    first_beacon = end_i - (seg_num_beacons - 1)  # 第一个 beacon 的位置
 
                     # 训练/推理对齐：推理时 KV 压缩会保留每段开头的 sinks tokens，
-                    # 因此训练时不应把 sinks 区域遮蔽掉，否则模型推理阶段突然“看到” sinks 会很突兀。
+                    # 因此训练时不应把 sinks 区域遮蔽掉，否则模型推理阶段突然"看到" sinks 会很突兀。
                     mask_start = min(start_i + self.num_sinks, first_beacon)
 
                     # 只有当被驱逐的 body（除 sinks 外）非空时才需要遮蔽
@@ -1285,11 +1321,11 @@ class Qwen3Model(Qwen3PreTrainedModel):
                         # 在 causal mask 中，后面的 beacon 已经能看到前面的 beacon
                         # 我们需要让前面的 beacon 也能看到后面的 beacon（打破 causal 约束）
                         # 这样所有 beacons 都能获得完整信息，协作压缩
-                        for i in range(self.num_beacons_per_segment):
+                        for i in range(seg_num_beacons):
                             beacon_i = first_beacon + i
                             if beacon_i >= seq_len:
                                 break
-                            for j in range(i + 1, self.num_beacons_per_segment):  # 让 beacon_i 能看到后面的 beacon_j
+                            for j in range(i + 1, seg_num_beacons):  # 让 beacon_i 能看到后面的 beacon_j
                                 beacon_j = first_beacon + j
                                 if beacon_j >= seq_len:
                                     break
@@ -1339,11 +1375,12 @@ class Qwen3Model(Qwen3PreTrainedModel):
             recon_losses: list[torch.Tensor] = []
             batch_size = hidden_states.shape[0]
             seq_len = hidden_states.shape[1]
-            num_beacons = self.num_beacons_per_segment
 
             for b in range(min(batch_size, len(qa_segments))):
-                for (start_i, end_i) in qa_segments[b]:
-                    first_beacon = end_i - (num_beacons - 1)
+                for segment_info in qa_segments[b]:
+                    # qa_segments格式: (start_i, end_i, seg_num_beacons)
+                    start_i, end_i, seg_num_beacons = segment_info
+                    first_beacon = end_i - (seg_num_beacons - 1)
                     if first_beacon < 0 or first_beacon >= seq_len:
                         continue
 
@@ -1354,9 +1391,9 @@ class Qwen3Model(Qwen3PreTrainedModel):
                     if body_len <= 0:
                         continue
 
-                    for j in range(num_beacons):
-                        chunk_start = body_start + (j * body_len) // num_beacons
-                        chunk_end = body_start + ((j + 1) * body_len) // num_beacons
+                    for j in range(seg_num_beacons):
+                        chunk_start = body_start + (j * body_len) // seg_num_beacons
+                        chunk_end = body_start + ((j + 1) * body_len) // seg_num_beacons
                         if chunk_end <= chunk_start:
                             continue
 
@@ -1464,15 +1501,19 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         cache_position=None,
         position_ids=None,
         use_cache=True,
+        num_beacons=None,
         **kwargs,
     ):
         """
-        准备生成所需的输入，确保 enable_beacon_compression 参数正确传递。
+        准备生成所需的输入，确保 enable_beacon_compression 和 num_beacons 参数正确传递。
 
         关键设计 (2024-12 修正):
         - 压缩后不修正 RoPE，保持原始位置编码
         - 新生成的 token 的 position_ids 从原始序列长度继续
         - 这样训练和推理时的相对位置距离完全一致
+
+        Args:
+            num_beacons: 每个历史消息使用的beacon数量，如果为None则使用模型配置的默认值
         """
         # 如果有 past_key_values，说明是 decoding 阶段，只取最后一个 token
         if past_key_values is not None:
@@ -1549,6 +1590,11 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                     batch_size=batch_size,
                 )
 
+        # 获取 num_beacons：优先使用传入的参数，其次使用模型属性，最后使用None（由模型决定）
+        effective_num_beacons = num_beacons
+        if effective_num_beacons is None:
+            effective_num_beacons = getattr(self, '_num_beacons', None)
+
         model_inputs.update(
             {
                 "position_ids": position_ids,
@@ -1558,13 +1604,22 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                 "attention_mask": attention_mask,
                 # 关键：使用模型属性传递自定义参数（避免 kwargs 被 generate() 过滤）
                 "enable_beacon_compression": getattr(self, 'enable_beacon_compression', True),
+                "num_beacons": effective_num_beacons,
             }
         )
         return model_inputs
 
-    def generate(self, input_ids=None, **kwargs):
+    def generate(self, input_ids=None, num_beacons=None, **kwargs):
         """
         重写 generate 方法，确保 beacon compression 参数正确设置
+
+        Args:
+            input_ids: 输入token ids
+            num_beacons: 每个历史消息使用的beacon数量。如果为None则使用模型配置的默认值。
+                        支持的格式：
+                        - int: 所有消息使用相同数量的beacon
+                        - dict: 按角色区分，如 {'user': 32, 'assistant': 64}（暂未实现）
+            **kwargs: 其他generate参数
         """
         # 重置状态变量，确保每次 generate 调用都是独立的
         self.model._original_seq_length = None
@@ -1574,8 +1629,16 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         if 'enable_beacon_compression' in kwargs:
             self.enable_beacon_compression = kwargs.pop('enable_beacon_compression')
 
+        # 存储 num_beacons 到模型属性，供 prepare_inputs_for_generation 使用
+        self._num_beacons = num_beacons
+
         # 调用父类的 generate 方法
-        return super().generate(input_ids=input_ids, **kwargs)
+        result = super().generate(input_ids=input_ids, **kwargs)
+
+        # 清理临时属性
+        self._num_beacons = None
+
+        return result
 
     @classmethod
     def from_pretrained(cls, *args, tokenizer=None, **kwargs):
@@ -1680,6 +1743,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         logits_to_keep: Union[int, torch.Tensor] = 0,
         enable_beacon_compression: Optional[bool] = True,
         include_beacon_recon_loss: Optional[bool] = None,
+        num_beacons: Optional[int] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> CausalLMOutputWithPast:
         r"""
@@ -1741,6 +1805,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             output_hidden_states=output_hidden_states,
             cache_position=cache_position,
             enable_beacon_compression=enable_beacon_compression,
+            num_beacons=num_beacons,
             **kwargs,
         )
 

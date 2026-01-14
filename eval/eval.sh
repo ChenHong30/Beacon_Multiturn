@@ -3,7 +3,7 @@
 
 # ------------------------------------------------------------------------------------------
 # Basic Configuration
-BEACON_MODEL_PATH="/data/hkustgz/model_weight/8_beacon_0_sink_distill_v2_attn_guided" # Path to the beacon model
+BEACON_MODEL_PATH="/data/hkustgz/model_weight/beacon-0.6B-dynamic" # Path to the beacon model
 BASE_MODEL_PATH="/data/hkustgz/model_weight/Qwen3-0.6B"
 CUDA_ID=0,1,2,3 # Comma-separated CUDA device IDs
 TASK_TYPE="multi_if" # Options: multi_if, mtbench_101, gsm8k
@@ -21,6 +21,7 @@ fi
 # ------------------------------------------------------------------------------------------
 # Beacon Configuration
 NUM_SINKS=0
+NUM_BEACONS=8
 # ------------------------------------------------------------------------------------------
 # Task-specific Scripts (MTBench-101)
 DATA_PATH="./eval/mtbench_101/mtbench101.jsonl"
@@ -43,6 +44,7 @@ TEMPERATURE_GSM8K=0.7
 echo "🚀 Evaluating $TASK_TYPE with $MODEL_TYPE model"
 echo "Model Path: $([ "$MODEL_TYPE" = "beacon" ] && echo "$BEACON_MODEL_PATH" || echo "$BASE_MODEL_PATH")"
 echo "Num Sinks : $NUM_SINKS"
+echo "Num Beacons: $NUM_BEACONS"
 echo "CUDA ID   : $CUDA_ID"
 echo "Workers   : $NUM_WORKERS"
 echo "Log Dir   : $LOG_DIR"
@@ -70,6 +72,7 @@ if [ "$TASK_TYPE" = "multi_if" ]; then
             --cuda_ids="$CUDA_ID" \
             --log_dir="$LOG_DIR" \
             --num_sinks="$NUM_SINKS" \
+            --num_beacons="$NUM_BEACONS" \
             --num_workers="$NUM_WORKERS"
     else
         python "eval/multi_if/eval_multi_if_base.py" \
@@ -87,6 +90,7 @@ elif [ "$TASK_TYPE" = "mtbench_101" ]; then
             --cuda_id="$CUDA_ID" \
             --log_dir="$LOG_DIR" \
             --num_sinks="$NUM_SINKS" \
+            --num_beacons="$NUM_BEACONS" \
             --max_new_tokens="$MAX_NEW_TOKENS" \
             --temperature="$TEMPERATURE" \
             --do_sample="$DO_SAMPLE" \
@@ -138,6 +142,5 @@ else
     echo "❌ Unknown TASK_TYPE: $TASK_TYPE. Please set to one of: multi_if, mtbench_101, gsm8k."
     exit 1
 fi
-
 
 
