@@ -12,6 +12,7 @@ MAX_NEW_TOKENS=256
 TEMPERATURE=0.7
 
 NUM_SINKS=0
+NUM_BEACONS=8
 NUM_WORKERS=16
 BEACON_SCRIPT="eval/coreference_resolution/eval_coreference_resolution_beacon.py"
 BASE_SCRIPT="eval/coreference_resolution/eval_coreference_resolution_base.py"
@@ -32,6 +33,7 @@ echo "Data Path : $COREF_PATH"
 echo "Temp      : $TEMPERATURE"
 if [ "$IS_BEACON" = "true" ]; then
     echo "Mode      : BEACON (Num Sinks: $NUM_SINKS)"
+    echo "Num Beacons: $NUM_BEACONS"
 else
     echo "Mode      : BASE (Standard Model)"
 fi
@@ -53,6 +55,7 @@ if [ "$IS_BEACON" = "true" ]; then
         --cuda_ids="$CUDA_ID" \
         --log_dir="$LOG_DIR" \
         --num_sinks="$NUM_SINKS" \
+        --num_beacons="$NUM_BEACONS" \
         --num_workers="$NUM_WORKERS" \
         --coref_path="$COREF_PATH" \
         --max_input_tokens="$MAX_INPUT_TOKENS" \

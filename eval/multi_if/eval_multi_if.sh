@@ -6,6 +6,7 @@ BASE_MODEL_PATH="/data/hkustgz/model_weight/Qwen3-0.6B"
 CUDA_ID=0,1,2,3
 LOG_DIR="/home/hkustgz/Beacon_Multiturn/logs/multi_if/8_beacon_0_sink_distill_v2_turn_embedding"
 NUM_SINKS=0
+NUM_BEACONS=8
 NUM_WORKERS=32
 BEACON_SCRIPT="eval/multi_if/eval_multi_if_beacon.py"
 BASE_SCRIPT="eval/multi_if/eval_multi_if_base.py"
@@ -24,6 +25,7 @@ echo "Workers   : $NUM_WORKERS"
 echo "Log Dir   : $LOG_DIR"
 if [ "$IS_BEACON" = "true" ]; then
     echo "Mode      : BEACON (Num Sinks: $NUM_SINKS)"
+    echo "Num Beacons: $NUM_BEACONS"
 else
     echo "Mode      : BASE (Standard Model)"
 fi
@@ -49,6 +51,7 @@ if [ "$IS_BEACON" = "true" ]; then
         --cuda_ids="$CUDA_ID" \
         --log_dir="$LOG_DIR" \
         --num_sinks="$NUM_SINKS" \
+        --num_beacons="$NUM_BEACONS" \
         --num_workers="$NUM_WORKERS"
 
 else

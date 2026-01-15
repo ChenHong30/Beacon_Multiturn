@@ -25,7 +25,13 @@ from modeling_qwen3 import Qwen3ForCausalLM
 # ============================================================
 # 1. Load Beacon model
 # ============================================================
-def load_beacon_model(model_path: str, device_id: int = 0, num_sinks: int = 0, tokenizer=None):
+def load_beacon_model(
+    model_path: str,
+    device_id: int = 0,
+    num_sinks: int = 0,
+    num_beacons: int = 16,
+    tokenizer=None,
+):
     print(f"Loading Beacon model: {model_path}")
 
     config = AutoConfig.from_pretrained(
@@ -33,9 +39,10 @@ def load_beacon_model(model_path: str, device_id: int = 0, num_sinks: int = 0, t
         trust_remote_code=True,
     )
     config.num_sinks = num_sinks
+    config.num_beacons_per_segment = num_beacons
 
-    print(f"num_sinks = {config.num_sinks}")
-    print(f"num_beacons_per_segment = {getattr(config, 'num_beacons_per_segment', None)}")
+    print(f"num_sinks = {num_sinks}")
+    print(f"num_beacons_per_segment = {num_beacons}")
 
     if torch.cuda.is_available():
         torch.cuda.set_device(device_id)
@@ -147,6 +154,7 @@ def generate_stream(
     temperature: float,
     do_sample: bool,
     top_p: Optional[float],
+    num_beacons: int,
 ):
     gen_kwargs: Dict[str, Any] = {
         "input_ids": input_ids,
@@ -156,6 +164,7 @@ def generate_stream(
         "pad_token_id": tokenizer.eos_token_id,
         "use_cache": True,
         "enable_beacon_compression": True,
+        "num_beacons": num_beacons,
     }
     if do_sample:
         gen_kwargs["temperature"] = temperature
@@ -178,6 +187,7 @@ def _run_worker(
     cuda_id: int,
     model_path: str,
     num_sinks: int,
+    num_beacons: int,
     answer_instruction: str,
     system_prompt: str,
     max_new_tokens: int,
@@ -211,9 +221,9 @@ def _run_worker(
         model_path=model_path,
         device_id=cuda_id,
         num_sinks=num_sinks,
+        num_beacons=num_beacons,
         tokenizer=tokenizer,
     )
-    num_beacons_per_segment = getattr(model.config, "num_beacons_per_segment", None)
 
     results: List[Dict[str, Any]] = []
     errors: List[Dict[str, Any]] = []
@@ -237,7 +247,7 @@ def _run_worker(
                 "top_p": top_p,
                 "enable_thinking": enable_thinking,
                 "num_sinks": num_sinks,
-                "num_beacons_per_segment": num_beacons_per_segment,
+                "num_beacons_per_segment": num_beacons,
                 "attempted": len(results) + len(errors),
                 "succeeded": len(results),
                 "failed": len(errors),
@@ -297,6 +307,7 @@ def _run_worker(
                     temperature=temperature,
                     do_sample=do_sample,
                     top_p=top_p,
+                    num_beacons=num_beacons,
                 )
 
                 gold = utils.parse_gsm8k_answer(sample.get("answer") or "")
@@ -362,6 +373,7 @@ def main(
     run_tag: Optional[str] = None,
     verbose: bool = False,
     num_sinks: int = 0,
+    num_beacons: Optional[int] = None,
     flush_every: int = 50,
     num_workers: int = 16,
 ):
@@ -372,19 +384,14 @@ def main(
     if do_sample is None:
         do_sample = temperature > 0.0
 
-    num_beacons_per_segment: Optional[int] = None
-    try:
-        cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-        num_beacons_per_segment = getattr(cfg, "num_beacons_per_segment", None)
-    except Exception as e:
-        print(f"[WARN] Failed to read model config from {model_path}: {e}")
+    if num_beacons is None:
+        raise SystemExit("num_beacons is required. Pass --num_beacons=<int>.")
+    num_beacons = int(num_beacons)
+    if num_beacons < 1:
+        raise SystemExit("num_beacons must be >= 1.")
 
     if run_tag is None:
-        beacon_part = (
-            f"{int(num_beacons_per_segment)}beacon"
-            if num_beacons_per_segment is not None
-            else "unknownbeacon"
-        )
+        beacon_part = f"{int(num_beacons)}beacon"
         run_tag = f"{beacon_part}_{int(num_sinks)}sink"
 
     cuda_id_list = _parse_cuda_ids(cuda_id=cuda_id, cuda_ids=cuda_ids)
@@ -434,6 +441,7 @@ def main(
                 "cuda_id": cid,
                 "model_path": model_path,
                 "num_sinks": num_sinks,
+                "num_beacons": num_beacons,
                 "answer_instruction": answer_instruction,
                 "system_prompt": system_prompt,
                 "max_new_tokens": max_new_tokens,
@@ -540,7 +548,7 @@ def main(
             "failed": len(errors),
             "worker_outputs": worker_paths,
             "failed_workers": failed_workers,
-            "num_beacons_per_segment": num_beacons_per_segment,
+            "num_beacons_per_segment": num_beacons,
             "num_sinks": num_sinks,
         },
         "metrics": metrics,

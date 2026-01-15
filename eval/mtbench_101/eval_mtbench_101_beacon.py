@@ -492,7 +492,12 @@ def _validate_cuda_ids(cuda_ids: List[int]) -> None:
             )
 
 
-def load_beacon_model(model_path: str, device_id: int = 0, num_sinks: int = 1):
+def load_beacon_model(
+    model_path: str,
+    device_id: int = 0,
+    num_sinks: int = 1,
+    num_beacons: int = 16,
+):
     import torch
     from transformers import AutoConfig
     from modeling_qwen3 import Qwen3ForCausalLM as BeaconQwen3ForCausalLM
@@ -500,9 +505,10 @@ def load_beacon_model(model_path: str, device_id: int = 0, num_sinks: int = 1):
     print(f"Loading Beacon model: {model_path}")
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     config.num_sinks = num_sinks
+    config.num_beacons_per_segment = num_beacons
 
-    print(f"num_sinks = {config.num_sinks}")
-    print(f"num_beacons_per_segment = {config.num_beacons_per_segment}")
+    print(f"num_sinks = {num_sinks}")
+    print(f"num_beacons_per_segment = {num_beacons}")
 
     if torch.cuda.is_available():
         torch.cuda.set_device(device_id)
@@ -544,6 +550,7 @@ def generate_response(
     temperature: float = 0.7,
     do_sample: bool = True,
     top_p: Optional[float] = None,
+    num_beacons: int = 16,
 ):
     import torch
 
@@ -556,6 +563,7 @@ def generate_response(
         "pad_token_id": tokenizer.eos_token_id,
         "use_cache": True,
         "enable_beacon_compression": True,
+        "num_beacons": num_beacons,
     }
     if top_p is not None:
         gen_kwargs["top_p"] = top_p
@@ -773,6 +781,7 @@ def _evaluate_dialogue(
     temperature: float,
     do_sample: bool,
     top_p: Optional[float],
+    num_beacons: int,
 ) -> List[Dict[str, Any]]:
     task = dialogue.get("task", "")
     multi_id = dialogue.get("id", None)
@@ -806,6 +815,7 @@ def _evaluate_dialogue(
             temperature=temperature,
             do_sample=do_sample,
             top_p=top_p,
+            num_beacons=num_beacons,
         )
 
         history_str = _build_history_str(turns, turn_index)
@@ -855,6 +865,7 @@ def _run_worker(
     cuda_id: int,
     model_path: str,
     num_sinks: int,
+    num_beacons: int,
     log_dir: str,
     timestamp: str,
     run_tag: str,
@@ -880,6 +891,7 @@ def _run_worker(
         model_path,
         device_id=cuda_id,
         num_sinks=num_sinks,
+        num_beacons=num_beacons,
     )
 
     judge_client = OpenAICompatClient(
@@ -908,6 +920,7 @@ def _run_worker(
                 "num_workers": num_workers,
                 "run_tag": run_tag,
                 "num_sinks": num_sinks,
+                "num_beacons_per_segment": num_beacons,
                 "judge_model": api_config["judge_model"],
                 "processed_dialogues": processed_dialogues,
                 "attempted_items": len(results),
@@ -944,6 +957,7 @@ def _run_worker(
                     temperature=temperature,
                     do_sample=do_sample,
                     top_p=top_p,
+                    num_beacons=num_beacons,
                 )
                 results.extend(dialog_results)
             except Exception as e:
@@ -979,6 +993,7 @@ def main(
     cuda_ids: Optional[str] = None,
     log_dir: Optional[str] = None,
     num_sinks: int = 1,
+    num_beacons: Optional[int] = None,
     max_new_tokens: int = 2048,
     temperature: float = 0.7,
     do_sample: bool = True,
@@ -1000,19 +1015,13 @@ def main(
     )
     api_config = _load_api_config(api_config_path)
 
-    num_beacons_per_segment: Optional[int] = None
-    try:
-        from transformers import AutoConfig
-        cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-        num_beacons_per_segment = getattr(cfg, "num_beacons_per_segment", None)
-    except Exception as e:
-        print(f"[WARN] Failed to read model config from {model_path}: {e}")
+    if num_beacons is None:
+        raise SystemExit("num_beacons is required. Pass --num_beacons=<int>.")
+    num_beacons = int(num_beacons)
+    if num_beacons < 1:
+        raise SystemExit("num_beacons must be >= 1.")
 
-    beacon_part = (
-        f"{int(num_beacons_per_segment)}beacon"
-        if num_beacons_per_segment is not None
-        else "unknownbeacon"
-    )
+    beacon_part = f"{int(num_beacons)}beacon"
     model_tag = osp.basename(model_path.rstrip("/"))
     run_tag = f"{model_tag}_{beacon_part}_{int(num_sinks)}sink"
     output_path = os.path.join(
@@ -1064,6 +1073,7 @@ def main(
                 "cuda_id": cid,
                 "model_path": model_path,
                 "num_sinks": num_sinks,
+                "num_beacons": num_beacons,
                 "log_dir": resolved_log_dir,
                 "timestamp": timestamp,
                 "run_tag": run_tag,
@@ -1158,7 +1168,7 @@ def main(
             "num_workers": final_num_workers,
             "num_dialogues": len(conversations),
             "run_tag": run_tag,
-            "num_beacons_per_segment": num_beacons_per_segment,
+            "num_beacons_per_segment": num_beacons,
             "num_sinks": num_sinks,
             "judge_model": api_config["judge_model"],
             "attempted_items": len(all_results),
@@ -1205,6 +1215,13 @@ if __name__ == "__main__":
     parser.add_argument("--cuda-ids", "--cuda_ids", dest="cuda_ids", default=None)
     parser.add_argument("--log-dir", "--log_dir", dest="log_dir", default=None)
     parser.add_argument("--num-sinks", "--num_sinks", dest="num_sinks", type=int, default=1)
+    parser.add_argument(
+        "--num-beacons",
+        "--num_beacons",
+        dest="num_beacons",
+        type=int,
+        required=True,
+    )
     parser.add_argument("--max-new-tokens", "--max_new_tokens", dest="max_new_tokens", type=int, default=2048)
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--do-sample", "--do_sample", dest="do_sample", type=lambda x: str(x).lower() != "false", default=True)
@@ -1222,6 +1239,7 @@ if __name__ == "__main__":
         cuda_ids=args.cuda_ids,
         log_dir=args.log_dir,
         num_sinks=args.num_sinks,
+        num_beacons=args.num_beacons,
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
         do_sample=args.do_sample,

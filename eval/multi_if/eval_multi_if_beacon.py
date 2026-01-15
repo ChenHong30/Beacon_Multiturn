@@ -27,7 +27,12 @@ from modeling_qwen3 import Qwen3ForCausalLM as BeaconQwen3ForCausalLM
 # ============================================================
 # 1. Load Beacon model
 # ============================================================
-def load_beacon_model(model_path: str, device_id: int = 0, num_sinks: int = 1):
+def load_beacon_model(
+    model_path: str,
+    device_id: int = 0,
+    num_sinks: int = 1,
+    num_beacons: int = 16,
+):
     print(f"Loading Beacon model: {model_path}")
 
     config = AutoConfig.from_pretrained(
@@ -35,9 +40,10 @@ def load_beacon_model(model_path: str, device_id: int = 0, num_sinks: int = 1):
         trust_remote_code=True
     )
     config.num_sinks = num_sinks
+    config.num_beacons_per_segment = num_beacons
 
-    print(f"num_sinks = {config.num_sinks}")
-    print(f"num_beacons_per_segment = {config.num_beacons_per_segment}")
+    print(f"num_sinks = {num_sinks}")
+    print(f"num_beacons_per_segment = {num_beacons}")
 
     if torch.cuda.is_available():
         torch.cuda.set_device(device_id)
@@ -143,6 +149,7 @@ def _run_worker(
     cuda_id: int,
     model_path: str,
     num_sinks: int,
+    num_beacons: int,
     log_dir: str,
     timestamp: str,
     run_tag: str,
@@ -166,6 +173,7 @@ def _run_worker(
             model_path,
             device_id=cuda_id,
             num_sinks=num_sinks,
+            num_beacons=num_beacons,
         )
         ds = load_dataset("facebook/Multi-IF")
     except Exception as e:
@@ -185,6 +193,7 @@ def _run_worker(
                 "num_workers": num_workers,
                 "run_tag": run_tag,
                 "num_sinks": num_sinks,
+                "num_beacons_per_segment": num_beacons,
                 "attempted": len(all_eval_results) + len(errors),
                 "succeeded": len(all_eval_results),
                 "failed": len(errors),
@@ -217,6 +226,7 @@ def _run_worker(
                     tokenizer=tokenizer,
                     device=device,
                     verbose=verbose,
+                    num_beacons=num_beacons,
                 )
                 eval_result = eval_multi_if_sample(
                     sample=sample,
@@ -284,7 +294,8 @@ def generate_stream(
     input_ids,
     attention_mask,
     tokenizer,
-    max_new_tokens: int = 2048
+    max_new_tokens: int = 2048,
+    num_beacons: int = 16,
 ):
     with torch.no_grad():
         output_ids = model.generate(
@@ -296,6 +307,7 @@ def generate_stream(
             pad_token_id=tokenizer.eos_token_id,
             use_cache=True,
             enable_beacon_compression=True,
+            num_beacons=num_beacons,
         )
 
     input_len = input_ids.shape[1]
@@ -343,6 +355,7 @@ def run_multi_if_sample(
     device,
     *,
     verbose: bool = False,
+    num_beacons: int = 16,
 ):
     dialogue = [
         {
@@ -376,7 +389,8 @@ def run_multi_if_sample(
             model,
             input_ids,
             attention_mask,
-            tokenizer
+            tokenizer,
+            num_beacons=num_beacons,
         )
 
         if verbose:
@@ -492,6 +506,7 @@ def main(
     log_dir: Optional[str] = None,
     verbose: bool = False,
     num_sinks: int = 1,
+    num_beacons: Optional[int] = None,
     flush_every: int = 1,
     num_workers: int = 16,
     seed: int = 42,
@@ -501,18 +516,13 @@ def main(
     os.makedirs(resolved_log_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    num_beacons_per_segment: Optional[int] = None
-    try:
-        cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-        num_beacons_per_segment = getattr(cfg, "num_beacons_per_segment", None)
-    except Exception as e:
-        print(f"[WARN] Failed to read model config from {model_path}: {e}")
+    if num_beacons is None:
+        raise SystemExit("num_beacons is required. Pass --num_beacons=<int>.")
+    num_beacons = int(num_beacons)
+    if num_beacons < 1:
+        raise SystemExit("num_beacons must be >= 1.")
 
-    beacon_part = (
-        f"{int(num_beacons_per_segment)}beacon"
-        if num_beacons_per_segment is not None
-        else "unknownbeacon"
-    )
+    beacon_part = f"{int(num_beacons)}beacon"
     run_tag = f"{beacon_part}_{int(num_sinks)}sink"
 
     output_path = os.path.join(
@@ -579,6 +589,7 @@ def main(
                 "cuda_id": cid,
                 "model_path": model_path,
                 "num_sinks": num_sinks,
+                "num_beacons": num_beacons,
                 "log_dir": resolved_log_dir,
                 "timestamp": timestamp,
                 "run_tag": run_tag,
@@ -672,7 +683,7 @@ def main(
             "splits": split_names,
             "total_english": total_english,
             "run_tag": run_tag,
-            "num_beacons_per_segment": num_beacons_per_segment,
+            "num_beacons_per_segment": num_beacons,
             "num_sinks": num_sinks,
             "attempted": len(all_eval_results) + len(errors),
             "succeeded": len(all_eval_results),

@@ -11,6 +11,7 @@ DATA_NAME=""  # set when DATA_PATH is a directory
 CONFIG_PATH="eval/mtbench_101/mtbench_101_config.json"
 
 NUM_SINKS=0
+NUM_BEACONS=8
 MAX_NEW_TOKENS=2048
 TEMPERATURE=0.7
 DO_SAMPLE=true
@@ -38,6 +39,7 @@ fi
 echo "Config    : $CONFIG_PATH"
 if [ "$IS_BEACON" = "true" ]; then
     echo "Mode      : BEACON (Num Sinks: $NUM_SINKS)"
+    echo "Num Beacons: $NUM_BEACONS"
 else
     echo "Mode      : BASE"
 fi
@@ -72,6 +74,7 @@ if [ "$IS_BEACON" = "true" ]; then
         --cuda_ids="$CUDA_ID" \
         --log_dir="$LOG_DIR" \
         --num_sinks="$NUM_SINKS" \
+        --num_beacons="$NUM_BEACONS" \
         --max_new_tokens="$MAX_NEW_TOKENS" \
         --temperature="$TEMPERATURE" \
         --do_sample="$DO_SAMPLE" \
