@@ -649,6 +649,13 @@ class Qwen3Model(Qwen3PreTrainedModel):
             torch.zeros(self.max_turns, config.hidden_size)
         )
 
+        # === Beacon 数量感知编码 (Num Beacons Embedding) ===
+        # 让模型显式知道当前使用了多少个 beacon，帮助模型适应不同的压缩比
+        # 索引 0 不使用，索引 i 表示使用 i 个 beacon
+        self.num_beacons_embedding = nn.Parameter(
+            torch.zeros(self.max_beacon_num + 1, config.hidden_size)
+        )
+
         # 用于记录压缩后的 KV cache 长度，供生成阶段使用
         self._compressed_seq_length = None
         # 用于记录压缩前的原始序列长度，供生成阶段计算 position_ids
@@ -699,17 +706,55 @@ class Qwen3Model(Qwen3PreTrainedModel):
             # 初始化 beacon position embedding（使用小的随机值）
             # 这让每个 beacon 位置有独特的初始化，帮助模型学习分工
             nn.init.normal_(self.beacon_position_embedding, mean=0.0, std=0.02)
-            
+
             # 初始化 beacon turn embedding（使用小的随机值）
             # 这让模型能区分不同轮次的历史信息
             nn.init.normal_(self.beacon_turn_embedding, mean=0.0, std=0.02)
             print(f"\033[93m[Beacon Init] Initialized turn embedding for {self.max_turns} turns\033[0m")
+
+            # 初始化 beacon 数量感知 embedding（使用小的随机值）
+            # 这让模型知道当前使用了多少个 beacon，帮助适应不同的压缩比
+            nn.init.normal_(self.num_beacons_embedding, mean=0.0, std=0.02)
+            print(f"\033[93m[Beacon Init] Initialized num_beacons embedding for 1-{self.max_beacon_num} beacons\033[0m")
 
     def get_input_embeddings(self):
         return self.embed_tokens
 
     def set_input_embeddings(self, value):
         self.embed_tokens = value
+
+    def get_beacon_position_embedding(self, pos_in_segment: int, num_beacons: int) -> torch.Tensor:
+        """
+        根据归一化相对位置获取插值后的 position embedding。
+
+        核心思想：让 position embedding 的语义与"相对位置"绑定，而非绝对索引。
+        这样无论 num_beacons 是 8 还是 64：
+        - 第一个 beacon (pos=0) 始终对应 normalized_pos=0.0
+        - 最后一个 beacon (pos=n-1) 始终对应 normalized_pos=1.0
+        - 中间 beacon 获得平滑插值的 embedding
+
+        Args:
+            pos_in_segment: beacon 在当前 segment 中的位置索引 (0-based)
+            num_beacons: 当前 segment 使用的 beacon 总数
+
+        Returns:
+            插值后的 position embedding [hidden_size]
+        """
+        # 计算归一化位置 [0, 1]
+        if num_beacons <= 1:
+            normalized_pos = 0.5  # 只有一个 beacon 时，使用中间位置
+        else:
+            normalized_pos = pos_in_segment / (num_beacons - 1)
+
+        # 映射到 [0, max_beacon_num-1] 的浮点索引
+        float_idx = normalized_pos * (self.max_beacon_num - 1)
+        lower_idx = int(float_idx)
+        upper_idx = min(lower_idx + 1, self.max_beacon_num - 1)
+        alpha = float_idx - lower_idx
+
+        # 线性插值
+        return (1 - alpha) * self.beacon_position_embedding[lower_idx] + \
+               alpha * self.beacon_position_embedding[upper_idx]
 
     def parse_multiturn_dialogue(
         self, input_ids: torch.Tensor, labels: Optional[torch.Tensor] = None,
@@ -1213,23 +1258,27 @@ class Qwen3Model(Qwen3PreTrainedModel):
                             else:
                                 # 后备方案：根据beacon组计算轮次
                                 turn_id = min(i // current_num_beacons, self.max_turns - 1)
-                            # 基础 embedding + 位置 embedding + 轮次 embedding
+                            # 基础 embedding + 归一化位置插值 embedding + 轮次 embedding + 数量感知 embedding
+                            # 使用 get_beacon_position_embedding 获取归一化位置的插值 embedding
+                            # 这样无论 num_beacons 是 8 还是 64，相同相对位置的 beacon 都能获得一致的语义
                             inputs_embeds[b, idx] = (
                                 self.beacon_embedding +
-                                self.beacon_position_embedding[pos_in_segment] +
-                                self.beacon_turn_embedding[turn_id]
+                                self.get_beacon_position_embedding(pos_in_segment, current_num_beacons) +
+                                self.beacon_turn_embedding[turn_id] +
+                                self.num_beacons_embedding[current_num_beacons]
                             )
             else:
                 inputs_embeds = self.embed_tokens(input_ids)
-                
+
                 # Fix for DDP unused parameters issue (Beacon Embeddings):
                 if self.training and self.beacon_embedding.requires_grad:
-                     dummy_beacon_emb = (
-                         self.beacon_embedding.sum() + 
-                         self.beacon_position_embedding.sum() +
-                         self.beacon_turn_embedding.sum()  # 添加轮次编码
-                     ) * 0.0
-                     inputs_embeds = inputs_embeds + dummy_beacon_emb
+                    dummy_beacon_emb = (
+                        self.beacon_embedding.sum() +
+                        self.beacon_position_embedding.sum() +
+                        self.beacon_turn_embedding.sum() +
+                        self.num_beacons_embedding.sum()  # 添加数量感知编码
+                    ) * 0.0
+                    inputs_embeds = inputs_embeds + dummy_beacon_emb
 
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache(config=self.config)

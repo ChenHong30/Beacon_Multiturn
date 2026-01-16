@@ -125,6 +125,14 @@ def parse_args() -> argparse.Namespace:
              "beacon count from 1 to max-beacon-num for each sample. If None, uses fixed num-beacons.",
     )
     parser.add_argument(
+        "--beacon-num-choices",
+        type=str,
+        default=None,
+        help="Comma-separated list of beacon numbers to sample from during training (e.g., '4,8,16'). "
+             "If set, training samples uniformly from this list instead of 1 to max-beacon-num. "
+             "Note: --max-beacon-num is still used for model config.",
+    )
+    parser.add_argument(
         "--num-sinks",
         type=int,
         default=4,
@@ -590,6 +598,7 @@ class DistillTrainer(Trainer):
         attn_guided_temperature: float = 1.0,
         max_beacon_num: Optional[int] = None,
         default_num_beacons: int = 16,
+        beacon_num_choices: Optional[List[int]] = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -609,7 +618,12 @@ class DistillTrainer(Trainer):
         # 动态beacon数量训练参数
         self.max_beacon_num = max_beacon_num
         self.default_num_beacons = default_num_beacons
-        self.dynamic_beacon_enabled = max_beacon_num is not None and max_beacon_num > 1
+        self.beacon_num_choices = beacon_num_choices
+        # 如果指定了choices或max_beacon_num，则启用动态beacon训练
+        self.dynamic_beacon_enabled = (
+            (beacon_num_choices is not None and len(beacon_num_choices) > 0)
+            or (max_beacon_num is not None and max_beacon_num > 1)
+        )
 
     @staticmethod
     def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
@@ -1035,9 +1049,12 @@ class DistillTrainer(Trainer):
 
         # 动态beacon数量采样：每个batch随机选择beacon数量
         if self.dynamic_beacon_enabled:
-            # 样本级别抽样：整个batch使用相同的beacon数量
-            # 从1到max_beacon_num均匀采样
-            num_beacons = np.random.randint(1, self.max_beacon_num + 1)
+            if self.beacon_num_choices is not None and len(self.beacon_num_choices) > 0:
+                # 从指定的离散选择空间中采样
+                num_beacons = int(np.random.choice(self.beacon_num_choices))
+            else:
+                # 从1到max_beacon_num均匀采样
+                num_beacons = np.random.randint(1, self.max_beacon_num + 1)
         else:
             # 使用固定的beacon数量（None表示使用模型配置的默认值）
             num_beacons = None
@@ -1303,6 +1320,12 @@ def main() -> None:
         }
         metrics_callback = JsonMetricsCallback(metrics_json_path, params_for_json)
 
+        # 解析beacon_num_choices参数
+        beacon_num_choices = None
+        if args.beacon_num_choices is not None:
+            beacon_num_choices = [int(x.strip()) for x in args.beacon_num_choices.split(",")]
+            logger.info("Using discrete beacon num choices: %s", beacon_num_choices)
+
         trainer = DistillTrainer(
             model=model,
             args=training_args,
@@ -1325,6 +1348,7 @@ def main() -> None:
             attn_guided_temperature=args.attn_guided_temperature,
             max_beacon_num=args.max_beacon_num,
             default_num_beacons=args.num_beacons,
+            beacon_num_choices=beacon_num_choices,
         )
 
         if args.resume_from_checkpoint is not None:

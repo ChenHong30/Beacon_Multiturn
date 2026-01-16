@@ -15,3 +15,7 @@ test_attention.py
 /verification
 model_weight
 beacon_baseline
+scripts/plot_spectral_summary.py
+scripts/spectral_analysis_attention.py
+scripts/plot_attention_heatmap.py
+beacon_inference.py

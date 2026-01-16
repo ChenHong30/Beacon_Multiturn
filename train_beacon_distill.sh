@@ -22,7 +22,8 @@ NUM_EPOCHS="16"
 WARMUP_RATIO="0.03"
 SAVE_STEPS="1000"
 NUM_BEACONS="8"
-MAX_BEACON_NUM="64"  # 动态beacon训练：训练时从1到128随机采样beacon数量
+MAX_BEACON_NUM="32"  # 动态beacon训练：训练时从1到max随机采样beacon数量
+BEACON_NUM_CHOICES="8,32"  # 离散beacon数量选择空间，如 "4,8,16"，为空则使用1到max_beacon_num
 NUM_SINKS="0"
 BEACON_RECON_WEIGHT="1.0"
 DISTILL_WEIGHT="1.0"
@@ -62,6 +63,7 @@ echo "Warmup ratio: $WARMUP_RATIO"
 echo "Epochs: $NUM_EPOCHS"
 echo "Num beacons: $NUM_BEACONS"
 echo "Max beacon num: $MAX_BEACON_NUM"
+echo "Beacon num choices: $BEACON_NUM_CHOICES"
 echo "Num sinks: $NUM_SINKS"
 echo "Beacon recon weight: $BEACON_RECON_WEIGHT"
 echo "Distill weight: $DISTILL_WEIGHT"
@@ -75,6 +77,12 @@ echo "Attn guided distill weight: $ATTN_GUIDED_DISTILL_WEIGHT"
 echo "Attn guided layers: $ATTN_GUIDED_LAYERS"
 echo "Attn guided temperature: $ATTN_GUIDED_TEMPERATURE"
 echo "========================================"
+
+# 构建可选参数
+BEACON_NUM_CHOICES_ARG=""
+if [ -n "$BEACON_NUM_CHOICES" ]; then
+    BEACON_NUM_CHOICES_ARG="--beacon-num-choices $BEACON_NUM_CHOICES"
+fi
 
 if [ "$N_GPUS" -gt 1 ]; then
     echo "Starting distributed training with $N_GPUS GPUs..."
@@ -96,6 +104,7 @@ if [ "$N_GPUS" -gt 1 ]; then
         --save-steps $SAVE_STEPS \
         --num-beacons $NUM_BEACONS \
         --max-beacon-num $MAX_BEACON_NUM \
+        $BEACON_NUM_CHOICES_ARG \
         --num-sinks $NUM_SINKS \
         --beacon-recon-weight $BEACON_RECON_WEIGHT \
         --distill-weight $DISTILL_WEIGHT \
@@ -129,6 +138,7 @@ else
         --save-steps $SAVE_STEPS \
         --num-beacons $NUM_BEACONS \
         --max-beacon-num $MAX_BEACON_NUM \
+        $BEACON_NUM_CHOICES_ARG \
         --num-sinks $NUM_SINKS \
         --beacon-recon-weight $BEACON_RECON_WEIGHT \
         --distill-weight $DISTILL_WEIGHT \
