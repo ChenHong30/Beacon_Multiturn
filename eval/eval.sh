@@ -3,7 +3,7 @@
 
 # ------------------------------------------------------------------------------------------
 # Basic Configuration
-BEACON_MODEL_PATH="/home/hkustgz/Beacon_Multiturn/model_weight/beacon-0.6B-dynami-64" # Path to the beacon model
+BEACON_MODEL_PATH="/home/hkustgz/Beacon_Multiturn/model_weight/beacon-0.6B-dynamic-64" # Path to the beacon model
 BASE_MODEL_PATH="/data/hkustgz/model_weight/Qwen3-0.6B"
 CUDA_ID=0,1,2,3 # Comma-separated CUDA device IDs
 TASK_TYPE="multi_if" # Options: multi_if, mtbench_101, gsm8k
@@ -21,7 +21,7 @@ fi
 # ------------------------------------------------------------------------------------------
 # Beacon Configuration
 NUM_SINKS=0
-NUM_BEACONS=24
+NUM_BEACONS=25
 # ------------------------------------------------------------------------------------------
 # Task-specific Scripts (MTBench-101)
 DATA_PATH="./eval/mtbench_101/mtbench101.jsonl"
