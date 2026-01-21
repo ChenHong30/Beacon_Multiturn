@@ -3,12 +3,12 @@
 
 # ------------------------------------------------------------------------------------------
 # Basic Configuration
-BEACON_MODEL_PATH="/home/hkustgz/Beacon_Multiturn/model_weight/beacon-0.6B-dynamic-64" # Path to the beacon model
-BASE_MODEL_PATH="/data/hkustgz/model_weight/Qwen3-0.6B"
+BEACON_MODEL_PATH="/home/hkustgz/Beacon_Multiturn/model_weight/beacon-1.7B-dynamic-64" # Path to the beacon model
+BASE_MODEL_PATH="/data/hkustgz/model_weight/Qwen3-1.7B"
 CUDA_ID=0,1,2,3 # Comma-separated CUDA device IDs
-TASK_TYPE="multi_if" # Options: multi_if, mtbench_101, gsm8k
+TASK_TYPE="${1:-coreference_resolution}" # Options: multi_if, mtbench_101, gsm8k_variant, coreference_resolution
 MODEL_TYPE="beacon" # Options: beacon, base
-NUM_WORKERS=32 # Number of parallel workers for data loading
+NUM_WORKERS=8 # Number of parallel workers for data loading
 LOG_DIR="./logs/${TASK_TYPE}/$(basename "$BEACON_MODEL_PATH")" # Log directory based on task and model
 if [ ! -d "$LOG_DIR" ]; then
     mkdir -p "$LOG_DIR"
@@ -21,24 +21,29 @@ fi
 # ------------------------------------------------------------------------------------------
 # Beacon Configuration
 NUM_SINKS=0
-NUM_BEACONS=25
+NUM_BEACONS=24
 # ------------------------------------------------------------------------------------------
 # Task-specific Scripts (MTBench-101)
 DATA_PATH="./eval/mtbench_101/mtbench101.jsonl"
-OPENAI_CONFIG_PATH="./eval/mtbench_101/mtbench_101_config.json"
-MAX_NEW_TOKENS=2048
+DATA_NAME=""  # set when DATA_PATH is a directory
+CONFIG_PATH="./eval/mtbench_101/mtbench_101_config.json"
+MAX_NEW_TOKENS_MTBENCH=2048
 TEMPERATURE_MTBENCH=0.7
 DO_SAMPLE=true
 TOP_P=""
 FLUSH_EVERY=1
 # ------------------------------------------------------------------------------------------
-# Task-specific Scripts (GSM8K)
-HISTORY_MAX_TURNS=6
-MAX_INPUT_TOKENS=4096
+# Task-specific Scripts (GSM8K Variant)
+GSM8K_VARIANT_PATH="./eval/gsm8k_variant/gsm8k_variant_dataset.jsonl"
+MAX_INPUT_TOKENS_GSM8K=8192
 MAX_NEW_TOKENS_GSM8K=1024
-ULTRACHAT_PATH="./ultrachat-200k.jsonl"
-GSM8K_SPLIT="test"
 TEMPERATURE_GSM8K=0.7
+# ------------------------------------------------------------------------------------------
+# Task-specific Scripts (Coreference Resolution)
+COREF_PATH="./eval/coreference_resolution/coref_dataset.jsonl"
+MAX_INPUT_TOKENS_COREF=8192
+MAX_NEW_TOKENS_COREF=256
+TEMPERATURE_COREF=0.7
 # ------------------------------------------------------------------------------------------
 # Evaluation Execution
 echo "🚀 Evaluating $TASK_TYPE with $MODEL_TYPE model"
@@ -50,19 +55,25 @@ echo "Workers   : $NUM_WORKERS"
 echo "Log Dir   : $LOG_DIR"
 if [ "$TASK_TYPE" = "mtbench_101" ]; then
     echo "Data Path : $DATA_PATH"
-    echo "Config    : $OPENAI_CONFIG_PATH"
-    echo "Max New Tokens: $MAX_NEW_TOKENS"
+    if [ -n "$DATA_NAME" ]; then
+        echo "Data Name : $DATA_NAME"
+    fi
+    echo "Config    : $CONFIG_PATH"
+    echo "Max New Tokens: $MAX_NEW_TOKENS_MTBENCH"
     echo "Temperature   : $TEMPERATURE_MTBENCH"
     echo "Do Sample     : $DO_SAMPLE"
     echo "Top P         : ${TOP_P:-'N/A'}"
     echo "Flush Every   : $FLUSH_EVERY"
-elif [ "$TASK_TYPE" = "gsm8k" ]; then
-    echo "Ultrachat Path: $ULTRACHAT_PATH"
-    echo "Max Input Tokens: $MAX_INPUT_TOKENS"
+elif [ "$TASK_TYPE" = "gsm8k_variant" ]; then
+    echo "Data Path : $GSM8K_VARIANT_PATH"
+    echo "Max Input Tokens: $MAX_INPUT_TOKENS_GSM8K"
     echo "Max New Tokens  : $MAX_NEW_TOKENS_GSM8K"
-    echo "Split     : $GSM8K_SPLIT"
-    echo "Max Turns     : $HISTORY_MAX_TURNS"
-    echo "Temp      : $TEMPERATURE_GSM8K"
+    echo "Temperature     : $TEMPERATURE_GSM8K"
+elif [ "$TASK_TYPE" = "coreference_resolution" ]; then
+    echo "Data Path : $COREF_PATH"
+    echo "Max Input Tokens: $MAX_INPUT_TOKENS_COREF"
+    echo "Max New Tokens  : $MAX_NEW_TOKENS_COREF"
+    echo "Temperature     : $TEMPERATURE_COREF"
 fi
 
 if [ "$TASK_TYPE" = "multi_if" ]; then
@@ -82,64 +93,96 @@ if [ "$TASK_TYPE" = "multi_if" ]; then
             --num_workers="$NUM_WORKERS"
     fi
 elif [ "$TASK_TYPE" = "mtbench_101" ]; then
+    NAME_ARG=""
+    if [ -n "$DATA_NAME" ]; then
+        NAME_ARG="--name=$DATA_NAME"
+    fi
+    TOP_P_ARG=""
+    if [ -n "$TOP_P" ]; then
+        TOP_P_ARG="--top_p=$TOP_P"
+    fi
+
     if [ "$MODEL_TYPE" = "beacon" ]; then
         python "eval/mtbench_101/eval_mtbench_101_beacon.py" \
             --model_path="$BEACON_MODEL_PATH" \
             --data_path="$DATA_PATH" \
-            --config_path="$OPENAI_CONFIG_PATH" \
-            --cuda_id="$CUDA_ID" \
+            $NAME_ARG \
+            --config_path="$CONFIG_PATH" \
+            --cuda_ids="$CUDA_ID" \
             --log_dir="$LOG_DIR" \
             --num_sinks="$NUM_SINKS" \
             --num_beacons="$NUM_BEACONS" \
-            --max_new_tokens="$MAX_NEW_TOKENS" \
-            --temperature="$TEMPERATURE" \
+            --max_new_tokens="$MAX_NEW_TOKENS_MTBENCH" \
+            --temperature="$TEMPERATURE_MTBENCH" \
             --do_sample="$DO_SAMPLE" \
-            --top_p="$TOP_P" \
+            $TOP_P_ARG \
             --flush_every="$FLUSH_EVERY" \
             --num_workers="$NUM_WORKERS"
     else
         python "eval/mtbench_101/eval_mtbench_101_base.py" \
             --model_path="$BASE_MODEL_PATH" \
             --data_path="$DATA_PATH" \
-            --config_path="$OPENAI_CONFIG_PATH" \
-            --cuda_id="$CUDA_ID" \
+            $NAME_ARG \
+            --config_path="$CONFIG_PATH" \
+            --cuda_ids="$CUDA_ID" \
             --log_dir="$LOG_DIR" \
-            --max_new_tokens="$MAX_NEW_TOKENS" \
-            --temperature="$TEMPERATURE" \
+            --max_new_tokens="$MAX_NEW_TOKENS_MTBENCH" \
+            --temperature="$TEMPERATURE_MTBENCH" \
             --do_sample="$DO_SAMPLE" \
-            --top_p="$TOP_P" \
+            $TOP_P_ARG \
             --flush_every="$FLUSH_EVERY" \
             --num_workers="$NUM_WORKERS"
     fi
-elif [ "$TASK_TYPE" = "gsm8k" ]; then
+elif [ "$TASK_TYPE" = "gsm8k_variant" ]; then
     if [ "$MODEL_TYPE" = "beacon" ]; then
-        python "eval/gsm8k_interference/eval_gsm8k_interference_beacon.py" \
+        python "eval/gsm8k_variant/eval_gsm8k_variant_beacon.py" \
             --model_path="$BEACON_MODEL_PATH" \
             --cuda_ids="$CUDA_ID" \
             --log_dir="$LOG_DIR" \
             --num_sinks="$NUM_SINKS" \
+            --num_beacons="$NUM_BEACONS" \
             --num_workers="$NUM_WORKERS" \
-            --ultrachat_path="$ULTRACHAT_PATH" \
-            --history_max_turns="$HISTORY_MAX_TURNS" \
-            --max_input_tokens="$MAX_INPUT_TOKENS" \
+            --gsm8k_variant_path="$GSM8K_VARIANT_PATH" \
+            --max_input_tokens="$MAX_INPUT_TOKENS_GSM8K" \
             --max_new_tokens="$MAX_NEW_TOKENS_GSM8K" \
-            --gsm8k_split="$GSM8K_SPLIT" \
             --temperature="$TEMPERATURE_GSM8K"
     else
-        python "eval/gsm8k_interference/eval_gsm8k_interference_base.py" \
+        python "eval/gsm8k_variant/eval_gsm8k_variant_base.py" \
             --model_path="$BASE_MODEL_PATH" \
             --cuda_ids="$CUDA_ID" \
             --log_dir="$LOG_DIR" \
             --num_workers="$NUM_WORKERS" \
-            --ultrachat_path="$ULTRACHAT_PATH" \
-            --history_max_turns="$HISTORY_MAX_TURNS" \
-            --max_input_tokens="$MAX_INPUT_TOKENS" \
+            --gsm8k_variant_path="$GSM8K_VARIANT_PATH" \
+            --max_input_tokens="$MAX_INPUT_TOKENS_GSM8K" \
             --max_new_tokens="$MAX_NEW_TOKENS_GSM8K" \
-            --gsm8k_split="$GSM8K_SPLIT" \
             --temperature="$TEMPERATURE_GSM8K"
     fi
+elif [ "$TASK_TYPE" = "coreference_resolution" ]; then
+    if [ "$MODEL_TYPE" = "beacon" ]; then
+        python "eval/coreference_resolution/eval_coreference_resolution_beacon.py" \
+            --model_path="$BEACON_MODEL_PATH" \
+            --cuda_ids="$CUDA_ID" \
+            --log_dir="$LOG_DIR" \
+            --num_sinks="$NUM_SINKS" \
+            --num_beacons="$NUM_BEACONS" \
+            --num_workers="$NUM_WORKERS" \
+            --coref_path="$COREF_PATH" \
+            --max_input_tokens="$MAX_INPUT_TOKENS_COREF" \
+            --max_new_tokens="$MAX_NEW_TOKENS_COREF" \
+            --temperature="$TEMPERATURE_COREF"
+    else
+        python "eval/coreference_resolution/eval_coreference_resolution_base.py" \
+            --model_path="$BASE_MODEL_PATH" \
+            --cuda_ids="$CUDA_ID" \
+            --log_dir="$LOG_DIR" \
+            --num_workers="$NUM_WORKERS" \
+            --coref_path="$COREF_PATH" \
+            --max_input_tokens="$MAX_INPUT_TOKENS_COREF" \
+            --max_new_tokens="$MAX_NEW_TOKENS_COREF" \
+            --temperature="$TEMPERATURE_COREF"
+    fi
 else
-    echo "❌ Unknown TASK_TYPE: $TASK_TYPE. Please set to one of: multi_if, mtbench_101, gsm8k."
+    echo "❌ Unknown TASK_TYPE: $TASK_TYPE. Please set to one of: multi_if, mtbench_101, gsm8k_variant, coreference_resolution."
     exit 1
 fi
 

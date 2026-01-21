@@ -9,14 +9,14 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-MODEL_PATH="/data/hkustgz/model_weight/Qwen3-0.6B/"
-TEACHER_MODEL_PATH="/data/hkustgz/model_weight/Qwen3-0.6B/"
+MODEL_PATH="/data/hkustgz/model_weight/Qwen3-1.7B/"
+TEACHER_MODEL_PATH="/data/hkustgz/model_weight/Qwen3-1.7B/"
 DATA_PATHS="dataset_multiturn_generated.jsonl"
-OUTPUT_DIR="/data/hkustgz/model_weight/beacon-0.6B-dynamic-64"
+OUTPUT_DIR="/data/hkustgz/model_weight/beacon-1.7B-dynamic-64"
 PROCESSED_CACHE_DIR="./runs/dataset_cache_generated"
 MAX_LENGTH="4096"
-BATCH_SIZE="4"
-GRAD_ACCUM="2"
+BATCH_SIZE="2"
+GRAD_ACCUM="4"
 LEARNING_RATE="1e-4"
 NUM_EPOCHS="16"
 WARMUP_RATIO="0.03"
@@ -160,4 +160,7 @@ fi
 
 echo "Training completed!"
 
-bash eval/eval.sh
+bash eval/eval.sh multi_if
+bash eval/eval.sh mtbench_101
+bash eval/eval.sh gsm8k_variant
+bash eval/eval.sh coreference_resolution

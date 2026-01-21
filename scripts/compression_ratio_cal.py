@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -21,6 +22,34 @@ class Counts:
     orig_history_tokens: int = 0
     comp_history_tokens: int = 0
     sum_turn_compression_percent: float = 0.0
+
+
+def detect_task_type(data: Dict[str, Any]) -> str:
+    """Automatically detect task type from log data structure."""
+    results = data.get("results", [])
+    if not results or not isinstance(results, list) or len(results) == 0:
+        raise ValueError("No results found in log file")
+
+    sample = results[0]
+
+    # Check for multi_if: has "turns" field with "prompt" and "response"
+    if "turns" in sample and isinstance(sample["turns"], list):
+        if len(sample["turns"]) > 0 and "prompt" in sample["turns"][0]:
+            return "multi_if"
+
+    # Check for mtbench_101: has "task" and "multi_id" fields
+    if "task" in sample and "multi_id" in sample and "turn_id" in sample:
+        return "mtbench_101"
+
+    # Check for gsm8k_variant or coreference_resolution: has "conversation" field
+    if "conversation" in sample and isinstance(sample["conversation"], list):
+        dataset = sample.get("dataset", "")
+        if "gsm8k" in dataset:
+            return "gsm8k_variant"
+        elif "coref" in dataset:
+            return "coreference_resolution"
+
+    raise ValueError(f"Unable to detect task type from log structure. Sample keys: {list(sample.keys())}")
 
 
 def _read_json_or_jsonl(path: Path) -> Dict[str, Any]:
@@ -94,7 +123,7 @@ def _gen_prompt_tokens(tokenizer, system_prompt: str, enable_thinking: bool) -> 
     return _count_tokens(tokenizer, with_gen) - _count_tokens(tokenizer, no_gen)
 
 
-def compute_compression(
+def compute_compression_multi_if(
     *,
     data: Dict[str, Any],
     tokenizer,
@@ -103,6 +132,7 @@ def compute_compression(
     num_sinks: int,
     enable_thinking: bool,
 ) -> Counts:
+    """Compute compression for Multi-IF task (original implementation)."""
     per_history_message_kept = num_beacons + num_sinks
 
     system_tokens = _count_tokens(
@@ -157,14 +187,201 @@ def compute_compression(
     return counts
 
 
+def compute_compression_conversation_based(
+    *,
+    data: Dict[str, Any],
+    tokenizer,
+    system_prompt: str,
+    num_beacons: int,
+    num_sinks: int,
+    enable_thinking: bool,
+) -> Counts:
+    """Compute compression for conversation-based tasks (gsm8k_variant, coreference_resolution)."""
+    per_history_message_kept = num_beacons + num_sinks
+
+    system_tokens = _count_tokens(
+        tokenizer, _chat_chunk(tokenizer, "system", system_prompt, enable_thinking)
+    )
+    gen_prompt_tokens = _gen_prompt_tokens(tokenizer, system_prompt, enable_thinking)
+
+    counts = Counts()
+
+    for sample in _iter_samples(data):
+        conversation = sample.get("conversation") or []
+        if not isinstance(conversation, list) or not conversation:
+            continue
+
+        counts.total_samples += 1
+
+        history_tokens = 0
+        history_messages = 0
+
+        # Process conversation turn by turn
+        for i, msg in enumerate(conversation):
+            if not isinstance(msg, dict):
+                continue
+
+            role = msg.get("role", "")
+            content = str(msg.get("content", ""))
+
+            if role == "user":
+                # Calculate compression at each user turn (before response)
+                user_tokens = _count_tokens(
+                    tokenizer, _chat_chunk(tokenizer, "user", content, enable_thinking)
+                )
+
+                orig_prompt = system_tokens + history_tokens + user_tokens + gen_prompt_tokens
+                comp_prompt = (
+                    system_tokens + (history_messages * per_history_message_kept) + user_tokens + gen_prompt_tokens
+                )
+
+                counts.total_turns += 1
+                counts.orig_prompt_tokens += orig_prompt
+                counts.comp_prompt_tokens += comp_prompt
+                counts.orig_history_tokens += history_tokens
+                counts.comp_history_tokens += history_messages * per_history_message_kept
+
+                if orig_prompt > 0:
+                    turn_compression_percent = 100.0 * (orig_prompt - comp_prompt) / float(orig_prompt)
+                    counts.sum_turn_compression_percent += turn_compression_percent
+
+                history_tokens += user_tokens
+                history_messages += 1
+
+            elif role == "assistant":
+                # Add assistant response to history
+                assistant_tokens = _count_tokens(
+                    tokenizer, _chat_chunk(tokenizer, "assistant", content, enable_thinking)
+                )
+                history_tokens += assistant_tokens
+                history_messages += 1
+
+    return counts
+
+
+def compute_compression_mtbench(
+    *,
+    data: Dict[str, Any],
+    tokenizer,
+    system_prompt: str,
+    num_beacons: int,
+    num_sinks: int,
+    enable_thinking: bool,
+    dataset_path: Optional[str] = None,
+) -> Counts:
+    """Compute compression for MTBench-101 task."""
+    per_history_message_kept = num_beacons + num_sinks
+
+    system_tokens = _count_tokens(
+        tokenizer, _chat_chunk(tokenizer, "system", system_prompt, enable_thinking)
+    )
+    gen_prompt_tokens = _gen_prompt_tokens(tokenizer, system_prompt, enable_thinking)
+
+    # Load original dataset to get dialogue history
+    if not dataset_path:
+        # Try to find dataset in default location
+        script_dir = Path(__file__).parent.parent
+        dataset_path = script_dir / "eval" / "mtbench_101" / "mtbench101.jsonl"
+
+    if not os.path.exists(dataset_path):
+        raise FileNotFoundError(f"MTBench-101 dataset not found at {dataset_path}. Please specify --dataset-path.")
+
+    # Load dialogues from dataset
+    dialogues = {}
+    with open(dataset_path, 'r', encoding='utf-8') as f:
+        for idx, line in enumerate(f):
+            line = line.strip()
+            if not line:
+                continue
+            dialogue = json.loads(line)
+            dialogues[idx] = dialogue
+
+    counts = Counts()
+    processed_dialogues = set()
+
+    for sample in _iter_samples(data):
+        dialogue_index = sample.get("dialogue_index")
+        turn_id = int(str(sample.get("turn_id", "1")))
+
+        if dialogue_index is None:
+            continue
+
+        if dialogue_index not in dialogues:
+            continue
+
+        dialogue = dialogues[dialogue_index]
+        history = dialogue.get("history", [])
+
+        # Skip first tasks based on task type
+        task = sample.get("task", "")
+        skip_first_tasks = ['FR', 'CR', 'AR', 'SA', 'SC', 'CM']
+        skip_first = task in skip_first_tasks
+
+        # Count samples (unique dialogues)
+        dialogue_key = (dialogue_index, turn_id)
+        if dialogue_index not in processed_dialogues:
+            processed_dialogues.add(dialogue_index)
+            counts.total_samples += 1
+
+        # Calculate compression for this turn
+        turn_index = turn_id - 1
+        if turn_index < 0 or turn_index >= len(history):
+            continue
+
+        if skip_first and turn_index == 0:
+            continue
+
+        # Build history up to current turn
+        history_tokens = 0
+        history_messages = 0
+
+        for i in range(turn_index):
+            user_msg = str(history[i].get("user", ""))
+            bot_msg = str(history[i].get("bot", ""))
+
+            user_tokens = _count_tokens(
+                tokenizer, _chat_chunk(tokenizer, "user", user_msg, enable_thinking)
+            )
+            assistant_tokens = _count_tokens(
+                tokenizer, _chat_chunk(tokenizer, "assistant", bot_msg, enable_thinking)
+            )
+
+            history_tokens += user_tokens + assistant_tokens
+            history_messages += 2
+
+        # Current turn user message
+        current_user = str(history[turn_index].get("user", ""))
+        user_tokens = _count_tokens(
+            tokenizer, _chat_chunk(tokenizer, "user", current_user, enable_thinking)
+        )
+
+        orig_prompt = system_tokens + history_tokens + user_tokens + gen_prompt_tokens
+        comp_prompt = (
+            system_tokens + (history_messages * per_history_message_kept) + user_tokens + gen_prompt_tokens
+        )
+
+        counts.total_turns += 1
+        counts.orig_prompt_tokens += orig_prompt
+        counts.comp_prompt_tokens += comp_prompt
+        counts.orig_history_tokens += history_tokens
+        counts.comp_history_tokens += history_messages * per_history_message_kept
+
+        if orig_prompt > 0:
+            turn_compression_percent = 100.0 * (orig_prompt - comp_prompt) / float(orig_prompt)
+            counts.sum_turn_compression_percent += turn_compression_percent
+
+    return counts
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Compute beacon compression rate (token reduction) for Multi-IF-style logs."
+        description="Compute beacon compression rate (token reduction) for evaluation logs. "
+                    "Automatically detects task type from log structure."
     )
     parser.add_argument("--log", required=True, help="Path to the evaluation log (.json or .jsonl).")
     parser.add_argument(
         "--tokenizer-model",
-        default="/data/hkustgz/model_weight/8_beacon_0_sink_distill_v2",
+        default="/data/hkustgz/model_weight/Qwen3-0.6B",
         help="Tokenizer/model path for token counting.",
     )
     parser.add_argument(
@@ -177,11 +394,20 @@ def main() -> None:
         action="store_true",
         help="Pass enable_thinking=True to apply_chat_template (default: False).",
     )
+    parser.add_argument(
+        "--dataset-path",
+        default=None,
+        help="Path to original dataset (only needed for MTBench-101 if auto-detection fails).",
+    )
     args = parser.parse_args()
 
     log_path = Path(args.log)
     data = _read_json_or_jsonl(log_path)
     meta = data.get("meta") if isinstance(data.get("meta"), dict) else {}
+
+    # Auto-detect task type
+    task_type = detect_task_type(data)
+    print(f"Detected task type: {task_type}")
 
     num_beacons = _safe_int(meta.get("num_beacons_per_segment"), 16)
     num_sinks = _safe_int(meta.get("num_sinks"), 4)
@@ -193,14 +419,37 @@ def main() -> None:
         local_files_only=True,
     )
 
-    counts = compute_compression(
-        data=data,
-        tokenizer=tokenizer,
-        system_prompt=args.system_prompt,
-        num_beacons=num_beacons,
-        num_sinks=num_sinks,
-        enable_thinking=bool(args.enable_thinking),
-    )
+    # Compute compression based on task type
+    if task_type == "multi_if":
+        counts = compute_compression_multi_if(
+            data=data,
+            tokenizer=tokenizer,
+            system_prompt=args.system_prompt,
+            num_beacons=num_beacons,
+            num_sinks=num_sinks,
+            enable_thinking=bool(args.enable_thinking),
+        )
+    elif task_type == "mtbench_101":
+        counts = compute_compression_mtbench(
+            data=data,
+            tokenizer=tokenizer,
+            system_prompt=args.system_prompt,
+            num_beacons=num_beacons,
+            num_sinks=num_sinks,
+            enable_thinking=bool(args.enable_thinking),
+            dataset_path=args.dataset_path,
+        )
+    elif task_type in ["gsm8k_variant", "coreference_resolution"]:
+        counts = compute_compression_conversation_based(
+            data=data,
+            tokenizer=tokenizer,
+            system_prompt=args.system_prompt,
+            num_beacons=num_beacons,
+            num_sinks=num_sinks,
+            enable_thinking=bool(args.enable_thinking),
+        )
+    else:
+        raise ValueError(f"Unsupported task type: {task_type}")
 
     def pct(reduced: int, original: int) -> float:
         if original <= 0:
@@ -232,6 +481,7 @@ def main() -> None:
         else 0.0
     )
 
+    print(f"task_type: {task_type}")
     print(f"log: {log_path}")
     print(f"tokenizer_model: {args.tokenizer_model}")
     print(f"num_samples: {counts.total_samples}")
