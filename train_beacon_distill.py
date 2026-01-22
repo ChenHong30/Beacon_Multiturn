@@ -585,7 +585,7 @@ class DistillTrainer(Trainer):
     def __init__(
         self,
         *args,
-        teacher_model: torch.nn.Module,
+        teacher_model: Optional[torch.nn.Module],
         distill_weight: float,
         ce_weight: float,
         temperature: float,
@@ -603,6 +603,7 @@ class DistillTrainer(Trainer):
     ):
         super().__init__(*args, **kwargs)
         self.teacher_model = teacher_model
+        self.need_teacher = teacher_model is not None
         self.distill_weight = distill_weight
         self.ce_weight = ce_weight
         self.temperature = temperature
@@ -1061,21 +1062,26 @@ class DistillTrainer(Trainer):
 
         # 判断是否需要额外输出
         need_student_attentions = self.beacon_attn_weight > 0.0
-        need_teacher_attentions = self.attn_guided_distill_weight > 0.0
-        need_hidden_states = self.hidden_distill_weight > 0.0
+        need_teacher_attentions = self.attn_guided_distill_weight > 0.0 and self.need_teacher
+        need_hidden_states = self.hidden_distill_weight > 0.0 and self.need_teacher
 
-        with torch.no_grad():
-            teacher_outputs = self.teacher_model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                use_cache=False,
-                enable_beacon_compression=False,
-                output_hidden_states=need_hidden_states,
-                output_attentions=need_teacher_attentions,
-            )
-            teacher_logits = teacher_outputs.logits
-            teacher_hidden_states = teacher_outputs.hidden_states if need_hidden_states else None
-            teacher_attentions = teacher_outputs.attentions if need_teacher_attentions else None
+        # 只有需要教师模型时才进行教师模型推理
+        teacher_logits = None
+        teacher_hidden_states = None
+        teacher_attentions = None
+        if self.need_teacher:
+            with torch.no_grad():
+                teacher_outputs = self.teacher_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    use_cache=False,
+                    enable_beacon_compression=False,
+                    output_hidden_states=need_hidden_states,
+                    output_attentions=need_teacher_attentions,
+                )
+                teacher_logits = teacher_outputs.logits
+                teacher_hidden_states = teacher_outputs.hidden_states if need_hidden_states else None
+                teacher_attentions = teacher_outputs.attentions if need_teacher_attentions else None
 
         student_outputs = model(
             input_ids=input_ids,
@@ -1094,18 +1100,20 @@ class DistillTrainer(Trainer):
         student_hidden_states = student_outputs.hidden_states if need_hidden_states else None
 
         student_model = self._unwrap_model(model)
-        kd_loss = self._compute_kd_loss(
-            student_model=student_model,
-            input_ids=input_ids,
-            labels=labels,
-            attention_mask=attention_mask,
-            student_logits=student_logits,
-            teacher_logits=teacher_logits,
-            num_beacons=num_beacons,
-        )
 
         loss = student_logits.new_tensor(0.0)
-        if self.distill_weight > 0.0:
+
+        # KD loss: 只有在有教师模型时才计算
+        if self.distill_weight > 0.0 and self.need_teacher:
+            kd_loss = self._compute_kd_loss(
+                student_model=student_model,
+                input_ids=input_ids,
+                labels=labels,
+                attention_mask=attention_mask,
+                student_logits=student_logits,
+                teacher_logits=teacher_logits,
+                num_beacons=num_beacons,
+            )
             loss = loss + self.distill_weight * kd_loss
         if self.ce_weight > 0.0 and ce_loss is not None:
             loss = loss + self.ce_weight * ce_loss
@@ -1128,7 +1136,7 @@ class DistillTrainer(Trainer):
             loss = loss + self.beacon_attn_weight * beacon_attn_loss
 
         # 方案2: 注意力引导的蒸馏 (Attention-Guided Beacon Distillation)
-        if self.attn_guided_distill_weight > 0.0 and teacher_attentions is not None:
+        if self.attn_guided_distill_weight > 0.0 and self.need_teacher and teacher_attentions is not None:
             attn_guided_kd_loss = self._compute_attention_guided_kd_loss(
                 student_model=student_model,
                 input_ids=input_ids,
@@ -1142,7 +1150,7 @@ class DistillTrainer(Trainer):
             loss = loss + self.attn_guided_distill_weight * attn_guided_kd_loss
 
         # 方案3: Hidden states蒸馏
-        if self.hidden_distill_weight > 0.0 and student_hidden_states is not None and teacher_hidden_states is not None:
+        if self.hidden_distill_weight > 0.0 and self.need_teacher and student_hidden_states is not None and teacher_hidden_states is not None:
             hidden_distill_loss = self._compute_hidden_distill_loss(
                 student_model=student_model,
                 input_ids=input_ids,
@@ -1254,20 +1262,33 @@ def main() -> None:
                 total_params / 1e6,
             )
 
-        teacher_path = args.teacher_model_path or args.model_path
-        teacher_config = AutoConfig.from_pretrained(teacher_path, trust_remote_code=True)
-        teacher_model = model_cls.from_pretrained(
-            teacher_path,
-            config=teacher_config,
-            tokenizer=tokenizer,
-            dtype=dtype,
-            device_map=None,
-            attn_implementation="eager",
+        # 判断是否需要加载教师模型
+        need_teacher = (
+            args.distill_weight > 0.0
+            or args.hidden_distill_weight > 0.0
+            or args.attn_guided_distill_weight > 0.0
         )
-        teacher_model.config.use_cache = False
-        teacher_model.eval()
-        for param in teacher_model.parameters():
-            param.requires_grad = False
+
+        teacher_model = None
+        if need_teacher:
+            teacher_path = args.teacher_model_path or args.model_path
+            teacher_config = AutoConfig.from_pretrained(teacher_path, trust_remote_code=True)
+            teacher_model = model_cls.from_pretrained(
+                teacher_path,
+                config=teacher_config,
+                tokenizer=tokenizer,
+                dtype=dtype,
+                device_map=None,
+                attn_implementation="eager",
+            )
+            teacher_model.config.use_cache = False
+            teacher_model.eval()
+            for param in teacher_model.parameters():
+                param.requires_grad = False
+            logger.info("Teacher model loaded from %s", teacher_path)
+        else:
+            logger.info("No teacher model needed (distill_weight=%.2f, hidden_distill_weight=%.2f, attn_guided_distill_weight=%.2f)",
+                       args.distill_weight, args.hidden_distill_weight, args.attn_guided_distill_weight)
 
         data_collator = BeaconDataCollator(tokenizer=tokenizer)
 
@@ -1312,7 +1333,8 @@ def main() -> None:
             training_kwargs.pop(key)
 
         training_args = TrainingArguments(**training_kwargs)
-        teacher_model.to(training_args.device)
+        if teacher_model is not None:
+            teacher_model.to(training_args.device)
 
         params_for_json = {
             "cli_args": sanitize_for_json(vars(args)),
