@@ -3,12 +3,12 @@
 
 # ------------------------------------------------------------------------------------------
 # Basic Configuration
-BEACON_MODEL_PATH="/home/hkustgz/Beacon_Multiturn/model_weight/beacon-1.7B-dynamic-64" # Path to the beacon model
+BEACON_MODEL_PATH="/home/hkustgz/Beacon_Multiturn/model_weight/beacon-0.6B-dynamic-64" # Path to the beacon model
 BASE_MODEL_PATH="/data/hkustgz/model_weight/Qwen3-4B"
 CUDA_ID=0,1,2,3 # Comma-separated CUDA device IDs
-TASK_TYPE="${1:-mtbench_101}" # Options: multi_if, mtbench_101, gsm8k_variant, coreference_resolution
-MODEL_TYPE="base" # Options: beacon, base
-NUM_WORKERS=8 # Number of parallel workers for data loading
+TASK_TYPE="${1:-coreference_resolution}" # Options: multi_if, mtbench_101, gsm8k_variant, coreference_resolution, mhj
+MODEL_TYPE="beacon" # Options: beacon, base
+NUM_WORKERS=4 # Number of parallel workers for data loading
 if [ "$MODEL_TYPE" = "beacon" ]; then
     LOG_DIR="./logs/${TASK_TYPE}/$(basename "$BEACON_MODEL_PATH")" # Log directory based on task and model
 else
@@ -25,7 +25,7 @@ fi
 # ------------------------------------------------------------------------------------------
 # Beacon Configuration
 NUM_SINKS=0
-NUM_BEACONS=8
+NUM_BEACONS=64
 # ------------------------------------------------------------------------------------------
 # Task-specific Scripts (MTBench-101)
 DATA_PATH="./eval/mtbench_101/mtbench101.jsonl"
@@ -48,6 +48,13 @@ COREF_PATH="./eval/coreference_resolution/coref_dataset.jsonl"
 MAX_INPUT_TOKENS_COREF=8192
 MAX_NEW_TOKENS_COREF=256
 TEMPERATURE_COREF=0.7
+# ------------------------------------------------------------------------------------------
+# Task-specific Scripts (MHJ - Multi-turn Human Jailbreaking)
+MHJ_PATH="./eval/mhj/mhj_dataset.jsonl"
+MHJ_CONFIG_PATH="./eval/mhj/mhj_config.json"
+MAX_NEW_TOKENS_MHJ=1024
+TEMPERATURE_MHJ=0.0
+DO_SAMPLE_MHJ=false
 # ------------------------------------------------------------------------------------------
 # Evaluation Execution
 echo "🚀 Evaluating $TASK_TYPE with $MODEL_TYPE model"
@@ -78,6 +85,12 @@ elif [ "$TASK_TYPE" = "coreference_resolution" ]; then
     echo "Max Input Tokens: $MAX_INPUT_TOKENS_COREF"
     echo "Max New Tokens  : $MAX_NEW_TOKENS_COREF"
     echo "Temperature     : $TEMPERATURE_COREF"
+elif [ "$TASK_TYPE" = "mhj" ]; then
+    echo "Data Path : $MHJ_PATH"
+    echo "Config    : $MHJ_CONFIG_PATH"
+    echo "Max New Tokens: $MAX_NEW_TOKENS_MHJ"
+    echo "Temperature   : $TEMPERATURE_MHJ"
+    echo "Do Sample     : $DO_SAMPLE_MHJ"
 fi
 
 if [ "$TASK_TYPE" = "multi_if" ]; then
@@ -185,8 +198,34 @@ elif [ "$TASK_TYPE" = "coreference_resolution" ]; then
             --max_new_tokens="$MAX_NEW_TOKENS_COREF" \
             --temperature="$TEMPERATURE_COREF"
     fi
+elif [ "$TASK_TYPE" = "mhj" ]; then
+    if [ "$MODEL_TYPE" = "beacon" ]; then
+        python "eval/mhj/eval_mhj_beacon.py" \
+            --model_path="$BEACON_MODEL_PATH" \
+            --data_path="$MHJ_PATH" \
+            --config_path="$MHJ_CONFIG_PATH" \
+            --cuda_ids="$CUDA_ID" \
+            --log_dir="$LOG_DIR" \
+            --num_sinks="$NUM_SINKS" \
+            --num_beacons="$NUM_BEACONS" \
+            --num_workers="$NUM_WORKERS" \
+            --max_new_tokens="$MAX_NEW_TOKENS_MHJ" \
+            --temperature="$TEMPERATURE_MHJ" \
+            --do_sample="$DO_SAMPLE_MHJ"
+    else
+        python "eval/mhj/eval_mhj_base.py" \
+            --model_path="$BASE_MODEL_PATH" \
+            --data_path="$MHJ_PATH" \
+            --config_path="$MHJ_CONFIG_PATH" \
+            --cuda_ids="$CUDA_ID" \
+            --log_dir="$LOG_DIR" \
+            --num_workers="$NUM_WORKERS" \
+            --max_new_tokens="$MAX_NEW_TOKENS_MHJ" \
+            --temperature="$TEMPERATURE_MHJ" \
+            --do_sample="$DO_SAMPLE_MHJ"
+    fi
 else
-    echo "❌ Unknown TASK_TYPE: $TASK_TYPE. Please set to one of: multi_if, mtbench_101, gsm8k_variant, coreference_resolution."
+    echo "❌ Unknown TASK_TYPE: $TASK_TYPE. Please set to one of: multi_if, mtbench_101, gsm8k_variant, coreference_resolution, mhj."
     exit 1
 fi
 
