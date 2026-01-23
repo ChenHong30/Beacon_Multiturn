@@ -9,14 +9,23 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-MODEL_PATH="/data/hkustgz/model_weight/Qwen3-1.7B/"
-TEACHER_MODEL_PATH="/data/hkustgz/model_weight/Qwen3-1.7B/"
+MODEL_PATH="/data/hkustgz/model_weight/Qwen3-4B/"
+TEACHER_MODEL_PATH="/data/hkustgz/model_weight/Qwen3-4B/"
 DATA_PATHS="dataset_multiturn_generated.jsonl"
-OUTPUT_DIR="/data/hkustgz/model_weight/beacon-1.7B-dynamic-64"
+
+# ============ GPU分离配置 ============
+# 将教师模型和学生模型放在不同GPU上以节省显存
+# STUDENT_GPUS: 用于学生模型DDP训练的GPU（决定DDP并行度）
+# TEACHER_GPUS: 用于教师模型推理的GPU
+# 留空TEACHER_GPUS则使用传统模式（教师和学生在同一GPU上）
+STUDENT_GPUS="0,1"      # 学生模型使用GPU 0,1进行2卡DDP训练
+TEACHER_GPUS="2,3"      # 教师模型放在GPU 2,3上
+# =====================================
+OUTPUT_DIR="/data/hkustgz/model_weight/beacon-4B-dynamic-64"
 PROCESSED_CACHE_DIR="./runs/dataset_cache_generated"
 MAX_LENGTH="4096"
-BATCH_SIZE="2"
-GRAD_ACCUM="4"
+BATCH_SIZE="1"
+GRAD_ACCUM="8"
 LEARNING_RATE="1e-4"
 NUM_EPOCHS="16"
 WARMUP_RATIO="0.03"
@@ -40,16 +49,26 @@ ATTN_GUIDED_LAYERS="-1"
 ATTN_GUIDED_TEMPERATURE="3.0"
 
 
-if [ -z "$CUDA_VISIBLE_DEVICES" ]; then
+# 计算学生模型使用的GPU数量（决定DDP并行度）
+if [ -n "$STUDENT_GPUS" ]; then
+    N_GPUS=$(echo "$STUDENT_GPUS" | tr ',' '\n' | wc -l)
+elif [ -z "$CUDA_VISIBLE_DEVICES" ]; then
     N_GPUS=$(nvidia-smi -L | wc -l)
 else
     N_GPUS=$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | wc -l)
 fi
 
+# 构建教师GPU参数
+TEACHER_GPUS_ARG=""
+if [ -n "$TEACHER_GPUS" ]; then
+    TEACHER_GPUS_ARG="--teacher-gpus $TEACHER_GPUS"
+fi
+
 echo "========================================"
 echo "Beacon Distillation Training (v2)"
 echo "========================================"
-echo "Number of GPUs: $N_GPUS"
+echo "Student GPUs (DDP): $STUDENT_GPUS (n=$N_GPUS)"
+echo "Teacher GPUs: $TEACHER_GPUS"
 echo "Student model path: $MODEL_PATH"
 echo "Teacher model path: $TEACHER_MODEL_PATH"
 echo "Data paths: $DATA_PATHS"
@@ -120,6 +139,7 @@ if [ "$N_GPUS" -gt 1 ]; then
         --bf16 \
         --train-beacon-only \
         --gradient-checkpointing \
+        $TEACHER_GPUS_ARG \
         "$@"
 else
     echo "Starting single GPU training..."
@@ -155,6 +175,7 @@ else
         --train-beacon-only \
         --train-lm-head \
         --gradient-checkpointing \
+        $TEACHER_GPUS_ARG \
         "$@"
 fi
 

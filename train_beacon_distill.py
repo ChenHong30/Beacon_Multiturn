@@ -210,6 +210,14 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Path to a specific checkpoint folder to resume training from.",
     )
+    parser.add_argument(
+        "--teacher-gpus",
+        type=str,
+        default=None,
+        help="Comma-separated GPU IDs to place the teacher model (e.g., '2,3'). "
+             "When set, teacher model is loaded onto these GPUs separately from student model. "
+             "Student DDP training should use different GPUs (e.g., set CUDA_VISIBLE_DEVICES=0,1 for student).",
+    )
 
     args = parser.parse_args()
     if args.fp16 and args.bf16:
@@ -599,11 +607,13 @@ class DistillTrainer(Trainer):
         max_beacon_num: Optional[int] = None,
         default_num_beacons: int = 16,
         beacon_num_choices: Optional[List[int]] = None,
+        teacher_device: Optional[torch.device] = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.teacher_model = teacher_model
         self.need_teacher = teacher_model is not None
+        self.teacher_device = teacher_device  # 教师模型所在的设备（跨GPU时使用）
         self.distill_weight = distill_weight
         self.ce_weight = ce_weight
         self.temperature = temperature
@@ -1071,17 +1081,34 @@ class DistillTrainer(Trainer):
         teacher_attentions = None
         if self.need_teacher:
             with torch.no_grad():
+                # 如果教师模型在不同的GPU上，需要跨GPU传输数据
+                if self.teacher_device is not None:
+                    teacher_input_ids = input_ids.to(self.teacher_device)
+                    teacher_attention_mask = attention_mask.to(self.teacher_device) if attention_mask is not None else None
+                else:
+                    teacher_input_ids = input_ids
+                    teacher_attention_mask = attention_mask
+
                 teacher_outputs = self.teacher_model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
+                    input_ids=teacher_input_ids,
+                    attention_mask=teacher_attention_mask,
                     use_cache=False,
                     enable_beacon_compression=False,
                     output_hidden_states=need_hidden_states,
                     output_attentions=need_teacher_attentions,
                 )
-                teacher_logits = teacher_outputs.logits
-                teacher_hidden_states = teacher_outputs.hidden_states if need_hidden_states else None
-                teacher_attentions = teacher_outputs.attentions if need_teacher_attentions else None
+
+                # 将教师模型输出传回学生模型所在的设备
+                student_device = input_ids.device
+                teacher_logits = teacher_outputs.logits.to(student_device)
+                if need_hidden_states and teacher_outputs.hidden_states is not None:
+                    teacher_hidden_states = tuple(h.to(student_device) for h in teacher_outputs.hidden_states)
+                else:
+                    teacher_hidden_states = None
+                if need_teacher_attentions and teacher_outputs.attentions is not None:
+                    teacher_attentions = tuple(a.to(student_device) for a in teacher_outputs.attentions)
+                else:
+                    teacher_attentions = None
 
         student_outputs = model(
             input_ids=input_ids,
@@ -1270,17 +1297,53 @@ def main() -> None:
         )
 
         teacher_model = None
+        teacher_device = None  # 教师模型所在的设备
         if need_teacher:
             teacher_path = args.teacher_model_path or args.model_path
             teacher_config = AutoConfig.from_pretrained(teacher_path, trust_remote_code=True)
-            teacher_model = model_cls.from_pretrained(
-                teacher_path,
-                config=teacher_config,
-                tokenizer=tokenizer,
-                dtype=dtype,
-                device_map=None,
-                attn_implementation="eager",
-            )
+
+            # 解析 teacher-gpus 参数
+            if args.teacher_gpus is not None:
+                teacher_gpu_ids = [int(x.strip()) for x in args.teacher_gpus.split(",")]
+                if len(teacher_gpu_ids) == 1:
+                    # 单卡：直接放到指定GPU
+                    teacher_device = torch.device(f"cuda:{teacher_gpu_ids[0]}")
+                    teacher_device_map = None
+                    logger.info("Teacher model will be placed on GPU %d", teacher_gpu_ids[0])
+                else:
+                    # 多卡：使用 device_map 自动分配
+                    teacher_device_map = "auto"
+                    # 设置 max_memory 只使用指定的GPU
+                    max_memory = {i: "80GiB" for i in teacher_gpu_ids}
+                    teacher_device = torch.device(f"cuda:{teacher_gpu_ids[0]}")  # 用于数据传输的参考设备
+                    logger.info("Teacher model will be distributed across GPUs %s", teacher_gpu_ids)
+            else:
+                teacher_device_map = None
+                teacher_device = None
+                max_memory = None
+
+            if teacher_device_map == "auto":
+                teacher_model = model_cls.from_pretrained(
+                    teacher_path,
+                    config=teacher_config,
+                    tokenizer=tokenizer,
+                    dtype=dtype,
+                    device_map=teacher_device_map,
+                    max_memory=max_memory,
+                    attn_implementation="eager",
+                )
+            else:
+                teacher_model = model_cls.from_pretrained(
+                    teacher_path,
+                    config=teacher_config,
+                    tokenizer=tokenizer,
+                    dtype=dtype,
+                    device_map=None,
+                    attn_implementation="eager",
+                )
+                if teacher_device is not None:
+                    teacher_model = teacher_model.to(teacher_device)
+
             teacher_model.config.use_cache = False
             teacher_model.eval()
             for param in teacher_model.parameters():
@@ -1333,7 +1396,9 @@ def main() -> None:
             training_kwargs.pop(key)
 
         training_args = TrainingArguments(**training_kwargs)
-        if teacher_model is not None:
+        # 只有在没有指定 teacher-gpus 时，才将教师模型移到训练设备
+        # 如果指定了 teacher-gpus，教师模型已经在独立的GPU上了
+        if teacher_model is not None and args.teacher_gpus is None:
             teacher_model.to(training_args.device)
 
         params_for_json = {
@@ -1371,6 +1436,7 @@ def main() -> None:
             max_beacon_num=args.max_beacon_num,
             default_num_beacons=args.num_beacons,
             beacon_num_choices=beacon_num_choices,
+            teacher_device=teacher_device,
         )
 
         if args.resume_from_checkpoint is not None:

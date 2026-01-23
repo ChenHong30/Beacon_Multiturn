@@ -703,19 +703,47 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 self.beacon_embedding.copy_(im_end_embedding)
                 print(f"\033[93m[Beacon Init] Using <|im_end|> embedding (no tokenizer provided)\033[0m")
 
-            # 初始化 beacon position embedding（使用小的随机值）
-            # 这让每个 beacon 位置有独特的初始化，帮助模型学习分工
-            nn.init.normal_(self.beacon_position_embedding, mean=0.0, std=0.02)
+            # 初始化 beacon position/turn/num embedding
+            #
+            # 关键改进：根据 hidden_size 缩放初始化 std
+            # 这确保辅助 embedding 相对于主 embedding 的比例在不同模型大小上保持一致
+            #
+            # 基准：hidden_size=1024 时使用 std=0.02
+            # 缩放公式：std = 0.02 * sqrt(1024 / hidden_size)
+            # - 0.6B (hidden_size=1024): std = 0.02
+            # - 1.7B (hidden_size=2048): std = 0.02 * sqrt(0.5) ≈ 0.0141
+            # - 4B+ (hidden_size=4096): std = 0.02 * sqrt(0.25) = 0.01
+            #
+            base_std = 0.02
+            scale_factor = (1024 / self.config.hidden_size) ** 0.5
+            scaled_std = base_std * scale_factor
 
-            # 初始化 beacon turn embedding（使用小的随机值）
-            # 这让模型能区分不同轮次的历史信息
-            nn.init.normal_(self.beacon_turn_embedding, mean=0.0, std=0.02)
-            print(f"\033[93m[Beacon Init] Initialized turn embedding for {self.max_turns} turns\033[0m")
+            # 使用确定性种子确保初始化可复现
+            # 保存当前 RNG 状态
+            rng_state = torch.get_rng_state()
+            cuda_rng_state = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
 
-            # 初始化 beacon 数量感知 embedding（使用小的随机值）
-            # 这让模型知道当前使用了多少个 beacon，帮助适应不同的压缩比
-            nn.init.normal_(self.num_beacons_embedding, mean=0.0, std=0.02)
-            print(f"\033[93m[Beacon Init] Initialized num_beacons embedding for 1-{self.max_beacon_num} beacons\033[0m")
+            # 设置确定性种子
+            torch.manual_seed(42)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed(42)
+
+            # 初始化 beacon position embedding
+            nn.init.normal_(self.beacon_position_embedding, mean=0.0, std=scaled_std)
+
+            # 初始化 beacon turn embedding
+            nn.init.normal_(self.beacon_turn_embedding, mean=0.0, std=scaled_std)
+
+            # 初始化 beacon 数量感知 embedding
+            nn.init.normal_(self.num_beacons_embedding, mean=0.0, std=scaled_std)
+
+            # 恢复 RNG 状态
+            torch.set_rng_state(rng_state)
+            if cuda_rng_state is not None:
+                torch.cuda.set_rng_state(cuda_rng_state)
+
+            print(f"\033[93m[Beacon Init] Initialized auxiliary embeddings with scaled std={scaled_std:.4f} (base=0.02, hidden_size={self.config.hidden_size})\033[0m")
+            print(f"\033[93m[Beacon Init] turn_embedding: {self.max_turns} turns, num_beacons_embedding: 1-{self.max_beacon_num} beacons\033[0m")
 
     def get_input_embeddings(self):
         return self.embed_tokens

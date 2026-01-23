@@ -4,12 +4,16 @@
 # ------------------------------------------------------------------------------------------
 # Basic Configuration
 BEACON_MODEL_PATH="/home/hkustgz/Beacon_Multiturn/model_weight/beacon-1.7B-dynamic-64" # Path to the beacon model
-BASE_MODEL_PATH="/data/hkustgz/model_weight/Qwen3-1.7B"
+BASE_MODEL_PATH="/data/hkustgz/model_weight/Qwen3-4B"
 CUDA_ID=0,1,2,3 # Comma-separated CUDA device IDs
-TASK_TYPE="${1:-coreference_resolution}" # Options: multi_if, mtbench_101, gsm8k_variant, coreference_resolution
-MODEL_TYPE="beacon" # Options: beacon, base
+TASK_TYPE="${1:-mtbench_101}" # Options: multi_if, mtbench_101, gsm8k_variant, coreference_resolution
+MODEL_TYPE="base" # Options: beacon, base
 NUM_WORKERS=8 # Number of parallel workers for data loading
-LOG_DIR="./logs/${TASK_TYPE}/$(basename "$BEACON_MODEL_PATH")" # Log directory based on task and model
+if [ "$MODEL_TYPE" = "beacon" ]; then
+    LOG_DIR="./logs/${TASK_TYPE}/$(basename "$BEACON_MODEL_PATH")" # Log directory based on task and model
+else
+    LOG_DIR="./logs/${TASK_TYPE}/$(basename "$BASE_MODEL_PATH")" # Log directory based on task and model
+fi
 if [ ! -d "$LOG_DIR" ]; then
     mkdir -p "$LOG_DIR"
     if [ $? -ne 0 ]; then
@@ -21,7 +25,7 @@ fi
 # ------------------------------------------------------------------------------------------
 # Beacon Configuration
 NUM_SINKS=0
-NUM_BEACONS=24
+NUM_BEACONS=8
 # ------------------------------------------------------------------------------------------
 # Task-specific Scripts (MTBench-101)
 DATA_PATH="./eval/mtbench_101/mtbench101.jsonl"
