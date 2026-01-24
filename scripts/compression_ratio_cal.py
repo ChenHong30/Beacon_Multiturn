@@ -32,8 +32,15 @@ def detect_task_type(data: Dict[str, Any]) -> str:
 
     sample = results[0]
 
-    # Check for multi_if: has "turns" field with "prompt" and "response"
+    # Check for safediabench
+    if "identification_score" in sample or "handling_score" in sample:
+        return "safediabench"
+
+    # Check for mhj: has "turns" with "user_content" and "response", plus "jailbroken" field
     if "turns" in sample and isinstance(sample["turns"], list):
+        if len(sample["turns"]) > 0 and "user_content" in sample["turns"][0]:
+            return "mhj"
+        # Check for multi_if: has "turns" field with "prompt" and "response"
         if len(sample["turns"]) > 0 and "prompt" in sample["turns"][0]:
             return "multi_if"
 
@@ -259,6 +266,213 @@ def compute_compression_conversation_based(
     return counts
 
 
+def compute_compression_mhj(
+    *,
+    data: Dict[str, Any],
+    tokenizer,
+    num_beacons: int,
+    num_sinks: int,
+    enable_thinking: bool,
+    dataset_path: Optional[str] = None,
+) -> Counts:
+    """
+    Compute compression for MHJ (Multi-turn Human Jailbreaking) task.
+
+    MHJ log structure:
+    - results: list of dialogues
+      - Each dialogue has: id, source, tactic, turns (list)
+      - Each turn has: user_content, response, judge_result
+
+    We need to load the original dataset to get system prompts.
+    """
+    per_history_message_kept = num_beacons + num_sinks
+
+    # Load original dataset to get system prompts
+    if not dataset_path:
+        script_dir = Path(__file__).parent.parent
+        dataset_path = script_dir / "eval" / "mhj" / "mhj_dataset.jsonl"
+
+    # Build mapping from id to system prompt
+    id_to_system: Dict[str, str] = {}
+    if os.path.exists(dataset_path):
+        with open(dataset_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                item = json.loads(line)
+                item_id = str(item.get("id", ""))
+                system_prompt = item.get("system", DEFAULT_SYSTEM_PROMPT)
+                id_to_system[item_id] = system_prompt
+
+    counts = Counts()
+
+    for sample in _iter_samples(data):
+        dialogue_id = str(sample.get("id", ""))
+        turns = sample.get("turns") or []
+        if not isinstance(turns, list) or not turns:
+            continue
+
+        counts.total_samples += 1
+
+        # Get system prompt for this dialogue
+        system_prompt = id_to_system.get(dialogue_id, DEFAULT_SYSTEM_PROMPT)
+        system_tokens = _count_tokens(
+            tokenizer, _chat_chunk(tokenizer, "system", system_prompt, enable_thinking)
+        )
+        gen_prompt_tokens = _gen_prompt_tokens(tokenizer, system_prompt, enable_thinking)
+
+        history_tokens = 0
+        history_messages = 0
+
+        for turn in turns:
+            if not isinstance(turn, dict):
+                continue
+
+            user_content = str(turn.get("user_content") or "")
+            response = str(turn.get("response") or "")
+
+            user_tokens = _count_tokens(
+                tokenizer, _chat_chunk(tokenizer, "user", user_content, enable_thinking)
+            )
+            assistant_tokens = _count_tokens(
+                tokenizer, _chat_chunk(tokenizer, "assistant", response, enable_thinking)
+            )
+
+            orig_prompt = system_tokens + history_tokens + user_tokens + gen_prompt_tokens
+            comp_prompt = (
+                system_tokens + (history_messages * per_history_message_kept) + user_tokens + gen_prompt_tokens
+            )
+
+            counts.total_turns += 1
+            counts.orig_prompt_tokens += orig_prompt
+            counts.comp_prompt_tokens += comp_prompt
+            counts.orig_history_tokens += history_tokens
+            counts.comp_history_tokens += history_messages * per_history_message_kept
+
+            if orig_prompt > 0:
+                turn_compression_percent = 100.0 * (orig_prompt - comp_prompt) / float(orig_prompt)
+                counts.sum_turn_compression_percent += turn_compression_percent
+
+            history_tokens += user_tokens + assistant_tokens
+            history_messages += 2
+
+    return counts
+
+
+def compute_compression_safediabench(
+    *,
+    data: Dict[str, Any],
+    tokenizer,
+    num_beacons: int,
+    num_sinks: int,
+    enable_thinking: bool,
+    dataset_path: Optional[str] = None,
+) -> Counts:
+    """
+    Compute compression for SafeDialBench task.
+    """
+    per_history_message_kept = num_beacons + num_sinks
+
+    # Load original dataset to get system prompts and history
+    if not dataset_path:
+        script_dir = Path(__file__).parent.parent
+        dataset_path = script_dir / "eval" / "safediabench" / "safediabench_dataset.jsonl"
+
+    # Build mapping from id to dialogue
+    id_to_dialogue: Dict[str, Any] = {}
+    if os.path.exists(dataset_path):
+        with open(dataset_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                item = json.loads(line)
+                item_id = str(item.get("id", ""))
+                id_to_dialogue[item_id] = item
+
+    counts = Counts()
+
+    for sample in _iter_samples(data):
+        dialogue_id = str(sample.get("id", ""))
+        turns = sample.get("turns") or []
+        if not isinstance(turns, list) or not turns:
+            continue
+        
+        # Get original dialogue
+        orig_dialogue = id_to_dialogue.get(dialogue_id)
+        if not orig_dialogue:
+             continue
+
+        counts.total_samples += 1
+
+        # System prompt
+        system_prompt = orig_dialogue.get("system")
+        system_tokens = 0
+        gen_prompt_tokens = 0
+        
+        # Calculate system tokens and gen prompt overhead
+        if system_prompt:
+             system_tokens = _count_tokens(
+                tokenizer, _chat_chunk(tokenizer, "system", system_prompt, enable_thinking)
+             )
+             gen_prompt_tokens = _gen_prompt_tokens(tokenizer, system_prompt, enable_thinking)
+        else:
+             # Calculate generation overhead without system prompt
+             dummy = [{"role": "user", "content": "x"}]
+             no_gen = tokenizer.apply_chat_template(
+                dummy, tokenize=False, add_generation_prompt=False, enable_thinking=enable_thinking
+             )
+             with_gen = tokenizer.apply_chat_template(
+                dummy, tokenize=False, add_generation_prompt=True, enable_thinking=enable_thinking
+             )
+             gen_prompt_tokens = _count_tokens(tokenizer, with_gen) - _count_tokens(tokenizer, no_gen)
+
+        history_tokens = 0
+        history_messages = 0
+        
+        # Original history from dataset
+        orig_history = orig_dialogue.get("history", [])
+
+        # Process each turn in the log
+        for i, turn_log in enumerate(turns):
+            if i >= len(orig_history):
+                break
+                
+            # Current turn user content
+            user_content = orig_history[i].get("user", "")
+            
+            user_tokens = _count_tokens(
+                tokenizer, _chat_chunk(tokenizer, "user", user_content, enable_thinking)
+            )
+            
+            orig_prompt = system_tokens + history_tokens + user_tokens + gen_prompt_tokens
+            comp_prompt = (
+                system_tokens + (history_messages * per_history_message_kept) + user_tokens + gen_prompt_tokens
+            )
+
+            counts.total_turns += 1
+            counts.orig_prompt_tokens += orig_prompt
+            counts.comp_prompt_tokens += comp_prompt
+            counts.orig_history_tokens += history_tokens
+            counts.comp_history_tokens += history_messages * per_history_message_kept
+
+            if orig_prompt > 0:
+                turn_compression_percent = 100.0 * (orig_prompt - comp_prompt) / float(orig_prompt)
+                counts.sum_turn_compression_percent += turn_compression_percent
+
+            # Update history with GROUND TRUTH response for next turn
+            bot_content = orig_history[i].get("bot", "")
+            assistant_tokens = _count_tokens(
+                tokenizer, _chat_chunk(tokenizer, "assistant", bot_content, enable_thinking)
+            )
+            
+            history_tokens += user_tokens + assistant_tokens
+            history_messages += 2
+
+    return counts
+
+
 def compute_compression_mtbench(
     *,
     data: Dict[str, Any],
@@ -428,6 +642,24 @@ def main() -> None:
             num_beacons=num_beacons,
             num_sinks=num_sinks,
             enable_thinking=bool(args.enable_thinking),
+        )
+    elif task_type == "mhj":
+        counts = compute_compression_mhj(
+            data=data,
+            tokenizer=tokenizer,
+            num_beacons=num_beacons,
+            num_sinks=num_sinks,
+            enable_thinking=bool(args.enable_thinking),
+            dataset_path=args.dataset_path,
+        )
+    elif task_type == "safediabench":
+        counts = compute_compression_safediabench(
+            data=data,
+            tokenizer=tokenizer,
+            num_beacons=num_beacons,
+            num_sinks=num_sinks,
+            enable_thinking=bool(args.enable_thinking),
+            dataset_path=args.dataset_path,
         )
     elif task_type == "mtbench_101":
         counts = compute_compression_mtbench(

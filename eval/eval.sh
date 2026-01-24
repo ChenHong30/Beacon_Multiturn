@@ -3,12 +3,12 @@
 
 # ------------------------------------------------------------------------------------------
 # Basic Configuration
-BEACON_MODEL_PATH="/home/hkustgz/Beacon_Multiturn/model_weight/beacon-0.6B-dynamic-64" # Path to the beacon model
-BASE_MODEL_PATH="/data/hkustgz/model_weight/Qwen3-4B"
+BEACON_MODEL_PATH="/home/hkustgz/Beacon_Multiturn/model_weight/beacon-1.7B-dynamic-64" # Path to the beacon model
+BASE_MODEL_PATH="/data/hkustgz/model_weight/Qwen3-1.7B"
 CUDA_ID=0,1,2,3 # Comma-separated CUDA device IDs
-TASK_TYPE="${1:-coreference_resolution}" # Options: multi_if, mtbench_101, gsm8k_variant, coreference_resolution, mhj
-MODEL_TYPE="beacon" # Options: beacon, base
-NUM_WORKERS=4 # Number of parallel workers for data loading
+TASK_TYPE="${1:-safediabench}" # Options: multi_if, mtbench_101, gsm8k_variant, coreference_resolution, mhj, safediabench
+MODEL_TYPE="base" # Options: beacon, base
+NUM_WORKERS=8 # Number of parallel workers for data loading
 if [ "$MODEL_TYPE" = "beacon" ]; then
     LOG_DIR="./logs/${TASK_TYPE}/$(basename "$BEACON_MODEL_PATH")" # Log directory based on task and model
 else
@@ -56,6 +56,18 @@ MAX_NEW_TOKENS_MHJ=1024
 TEMPERATURE_MHJ=0.0
 DO_SAMPLE_MHJ=false
 # ------------------------------------------------------------------------------------------
+# Task-specific Scripts (SafeDialBench - Fine-Grained Safety Benchmark)
+SAFEDIABENCH_PATH="./eval/safediabench/safediabench_dataset.jsonl"
+SAFEDIABENCH_CONFIG_PATH="./eval/safediabench/safediabench_config.json"
+SAFEDIABENCH_PROMPTS_DIR="./eval/safediabench/judge_prompts"
+MAX_NEW_TOKENS_SAFEDIABENCH=1024
+TEMPERATURE_SAFEDIABENCH=0.0
+DO_SAMPLE_SAFEDIABENCH=false
+ENABLE_SAMPLING_SAFEDIABENCH=true
+SAMPLE_SIZE_A_SAFEDIABENCH=200
+SAMPLE_SIZE_B_SAFEDIABENCH=200
+SAMPLE_SEED_SAFEDIABENCH=42
+# ------------------------------------------------------------------------------------------
 # Evaluation Execution
 echo "🚀 Evaluating $TASK_TYPE with $MODEL_TYPE model"
 echo "Model Path: $([ "$MODEL_TYPE" = "beacon" ] && echo "$BEACON_MODEL_PATH" || echo "$BASE_MODEL_PATH")"
@@ -91,6 +103,19 @@ elif [ "$TASK_TYPE" = "mhj" ]; then
     echo "Max New Tokens: $MAX_NEW_TOKENS_MHJ"
     echo "Temperature   : $TEMPERATURE_MHJ"
     echo "Do Sample     : $DO_SAMPLE_MHJ"
+elif [ "$TASK_TYPE" = "safediabench" ]; then
+    echo "Data Path : $SAFEDIABENCH_PATH"
+    echo "Config    : $SAFEDIABENCH_CONFIG_PATH"
+    echo "Prompts Dir   : $SAFEDIABENCH_PROMPTS_DIR"
+    echo "Max New Tokens: $MAX_NEW_TOKENS_SAFEDIABENCH"
+    echo "Temperature   : $TEMPERATURE_SAFEDIABENCH"
+    echo "Do Sample     : $DO_SAMPLE_SAFEDIABENCH"
+    echo "Enable Sampling: $ENABLE_SAMPLING_SAFEDIABENCH"
+    if [ "$ENABLE_SAMPLING_SAFEDIABENCH" = "true" ]; then
+        echo "Sample Size A : $SAMPLE_SIZE_A_SAFEDIABENCH"
+        echo "Sample Size B : $SAMPLE_SIZE_B_SAFEDIABENCH"
+        echo "Sample Seed   : $SAMPLE_SEED_SAFEDIABENCH"
+    fi
 fi
 
 if [ "$TASK_TYPE" = "multi_if" ]; then
@@ -224,8 +249,44 @@ elif [ "$TASK_TYPE" = "mhj" ]; then
             --temperature="$TEMPERATURE_MHJ" \
             --do_sample="$DO_SAMPLE_MHJ"
     fi
+elif [ "$TASK_TYPE" = "safediabench" ]; then
+    if [ "$MODEL_TYPE" = "beacon" ]; then
+        python "eval/safediabench/eval_safediabench_beacon.py" \
+            --model_path="$BEACON_MODEL_PATH" \
+            --data_path="$SAFEDIABENCH_PATH" \
+            --prompts_dir="$SAFEDIABENCH_PROMPTS_DIR" \
+            --config_path="$SAFEDIABENCH_CONFIG_PATH" \
+            --cuda_ids="$CUDA_ID" \
+            --log_dir="$LOG_DIR" \
+            --num_sinks="$NUM_SINKS" \
+            --num_beacons="$NUM_BEACONS" \
+            --num_workers="$NUM_WORKERS" \
+            --max_new_tokens="$MAX_NEW_TOKENS_SAFEDIABENCH" \
+            --temperature="$TEMPERATURE_SAFEDIABENCH" \
+            --do_sample="$DO_SAMPLE_SAFEDIABENCH" \
+            $([ "$ENABLE_SAMPLING_SAFEDIABENCH" = "true" ] && echo "--enable-sampling") \
+            --sample_size_a="$SAMPLE_SIZE_A_SAFEDIABENCH" \
+            --sample_size_b="$SAMPLE_SIZE_B_SAFEDIABENCH" \
+            --sample_seed="$SAMPLE_SEED_SAFEDIABENCH"
+    else
+        python "eval/safediabench/eval_safediabench_base.py" \
+            --model_path="$BASE_MODEL_PATH" \
+            --data_path="$SAFEDIABENCH_PATH" \
+            --prompts_dir="$SAFEDIABENCH_PROMPTS_DIR" \
+            --config_path="$SAFEDIABENCH_CONFIG_PATH" \
+            --cuda_ids="$CUDA_ID" \
+            --log_dir="$LOG_DIR" \
+            --num_workers="$NUM_WORKERS" \
+            --max_new_tokens="$MAX_NEW_TOKENS_SAFEDIABENCH" \
+            --temperature="$TEMPERATURE_SAFEDIABENCH" \
+            --do_sample="$DO_SAMPLE_SAFEDIABENCH" \
+            $([ "$ENABLE_SAMPLING_SAFEDIABENCH" = "true" ] && echo "--enable-sampling") \
+            --sample_size_a="$SAMPLE_SIZE_A_SAFEDIABENCH" \
+            --sample_size_b="$SAMPLE_SIZE_B_SAFEDIABENCH" \
+            --sample_seed="$SAMPLE_SEED_SAFEDIABENCH"
+    fi
 else
-    echo "❌ Unknown TASK_TYPE: $TASK_TYPE. Please set to one of: multi_if, mtbench_101, gsm8k_variant, coreference_resolution, mhj."
+    echo "❌ Unknown TASK_TYPE: $TASK_TYPE. Please set to one of: multi_if, mtbench_101, gsm8k_variant, coreference_resolution, mhj, safediabench."
     exit 1
 fi
 

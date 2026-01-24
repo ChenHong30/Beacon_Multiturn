@@ -177,17 +177,31 @@ def _run_worker(
         model_path=model_path,
         device_id=cuda_id,
     )
-    judge_client = beacon.OpenAICompatClient(
-        base_url=api_config["openai_base_url"],
-        api_key=api_config["openai_api_key"],
-        model=api_config["judge_model"],
-        timeout=api_config.get("request_timeout", 120),
-        max_retries=api_config.get("max_retries", 3),
-        retry_sleep=api_config.get("retry_sleep", 1.0),
-        temperature=api_config.get("temperature", 0.0),
-        top_p=api_config.get("top_p", 1.0),
-        max_tokens=api_config.get("max_tokens", 512),
-    )
+    # Select judge client based on config provider
+    judge_api_provider = api_config.get("judge_api_provider", "dashscope")
+    if judge_api_provider == "hkustgz":
+        judge_client = beacon.HKUSTGZJudgeClient(
+            api_key=api_config["hkustgz_api_key"],
+            model=api_config.get("hkustgz_model", "Qwen"),
+            timeout=api_config.get("request_timeout", 120),
+            max_retries=api_config.get("max_retries", 3),
+            retry_sleep=api_config.get("retry_sleep", 1.0),
+            temperature=api_config.get("temperature", 0.0),
+            top_p=api_config.get("top_p", 1.0),
+            max_tokens=api_config.get("max_tokens", 512),
+        )
+    else:
+        judge_client = beacon.OpenAICompatClient(
+            base_url=api_config["openai_base_url"],
+            api_key=api_config["openai_api_key"],
+            model=api_config["judge_model"],
+            timeout=api_config.get("request_timeout", 120),
+            max_retries=api_config.get("max_retries", 3),
+            retry_sleep=api_config.get("retry_sleep", 1.0),
+            temperature=api_config.get("temperature", 0.0),
+            top_p=api_config.get("top_p", 1.0),
+            max_tokens=api_config.get("max_tokens", 512),
+        )
 
     results: List[Dict[str, Any]] = []
     errors: List[Dict[str, Any]] = []
@@ -202,7 +216,8 @@ def _run_worker(
                 "worker_id": worker_id,
                 "num_workers": num_workers,
                 "run_tag": run_tag,
-                "judge_model": api_config["judge_model"],
+                "judge_api_provider": api_config.get("judge_api_provider", "dashscope"),
+                "judge_model": api_config.get("hkustgz_model", "Qwen") if api_config.get("judge_api_provider") == "hkustgz" else api_config["judge_model"],
                 "processed_dialogues": processed_dialogues,
                 "attempted_items": len(results),
                 "failed_dialogues": len(errors),
@@ -431,7 +446,8 @@ def main(
             "num_workers": final_num_workers,
             "num_dialogues": len(conversations),
             "run_tag": run_tag,
-            "judge_model": api_config["judge_model"],
+            "judge_api_provider": api_config.get("judge_api_provider", "dashscope"),
+            "judge_model": api_config.get("hkustgz_model", "Qwen") if api_config.get("judge_api_provider") == "hkustgz" else api_config["judge_model"],
             "attempted_items": len(all_results),
             "failed_dialogues": len(errors),
             "worker_outputs": worker_paths,

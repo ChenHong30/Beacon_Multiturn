@@ -18,8 +18,8 @@ DATA_PATHS="dataset_multiturn_generated.jsonl"
 # STUDENT_GPUS: 用于学生模型DDP训练的GPU（决定DDP并行度）
 # TEACHER_GPUS: 用于教师模型推理的GPU
 # 留空TEACHER_GPUS则使用传统模式（教师和学生在同一GPU上）
-STUDENT_GPUS="0,1"      # 学生模型使用GPU 0,1进行2卡DDP训练
-TEACHER_GPUS="2,3"      # 教师模型放在GPU 2,3上
+STUDENT_GPUS="0,1,2,3"
+TEACHER_GPUS=""
 # =====================================
 OUTPUT_DIR="/data/hkustgz/model_weight/beacon-4B-dynamic-64"
 PROCESSED_CACHE_DIR="./runs/dataset_cache_generated"

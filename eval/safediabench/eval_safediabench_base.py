@@ -1,15 +1,14 @@
 # flake8: noqa: E501
 """
-MHJ (Multi-turn Human Jailbreaking) evaluation script for Base model.
+SafeDialBench evaluation script for Base model (without Beacon compression).
 
-This script evaluates the safety/robustness of language models against multi-turn
-jailbreaking attacks from the MHJ dataset.
+This script evaluates the safety of language models against multi-turn
+jailbreaking attacks from the SafeDialBench dataset.
 
-Evaluation logic:
-1. For each sample, generate responses turn by turn
-2. After each turn, use a judge model to evaluate if the response is harmful/jailbroken
-3. If any turn is judged as jailbroken, mark the entire attack as successful and stop
-4. Calculate Attack Success Rate (ASR) across all samples
+Evaluation dimensions:
+1. Identification - Ability to identify safety risks
+2. Handling - Ability to handle/respond to risks appropriately
+3. Consistency - Consistency in maintaining safety across turns
 """
 import json
 import os
@@ -17,7 +16,7 @@ import sys
 import time
 import multiprocessing as mp
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import torch
 from transformers import AutoTokenizer, pipeline
@@ -27,7 +26,7 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 # Import shared utilities
-import eval.mhj.eval_mhj_beacon as beacon
+import eval.safediabench.eval_safediabench_beacon as beacon
 
 
 def create_generation_pipeline(model_path: str, device_id: int = 0):
@@ -89,45 +88,62 @@ def _evaluate_dialogue(
     dialogue_index: int,
     pipe,
     tokenizer,
-    judge_client: beacon.OpenAICompatClient,
+    judge_client: Union[beacon.OpenAICompatClient, beacon.HKUSTGZJudgeClient],
+    judge_prompts: Dict[str, Dict[str, Any]],
     max_new_tokens: int,
     temperature: float,
     do_sample: bool,
     top_p: Optional[float],
 ) -> Dict[str, Any]:
     """
-    Evaluate a single MHJ dialogue (multi-turn jailbreak attempt).
-
-    For each turn:
-    1. Generate model response
-    2. Judge if response is jailbroken
-    3. If jailbroken, stop and mark attack as successful
+    Evaluate a single SafeDialBench dialogue using base model.
     """
     dialogue_id = dialogue.get("id", dialogue_index)
-    source = dialogue.get("source", "")
-    tactic = dialogue.get("tactic", "")
-    submission_message = dialogue.get("submission_message", "")
-    system_prompt = dialogue.get("system")
-    user_turns = dialogue.get("history", [])
+    task = dialogue.get("task", "Ethics")
+    method = dialogue.get("method", "")
+    model_type = dialogue.get("model_type", "")
+    scene = dialogue.get("scene", "")
+    history = dialogue.get("history", [])
+
+    # Get appropriate judge prompt for this task
+    judge_type = beacon.TASK_TO_JUDGE_TYPE.get(task, "ethics-evaluation")
+    judge_prompt = judge_prompts.get(judge_type)
+    if not judge_prompt:
+        judge_prompt = judge_prompts.get("ethics-evaluation")
+
+    if not judge_prompt:
+        raise ValueError(f"No judge prompt found for task: {task}")
 
     results = {
         "id": dialogue_id,
-        "source": source,
-        "tactic": tactic,
-        "submission_message": submission_message,
-        "num_turns": len(user_turns),
-        "jailbroken": False,
-        "jailbreak_turn": None,
+        "task": task,
+        "method": method,
+        "model_type": model_type,
+        "scene": scene,
+        "num_turns": len(history),
+        "identification_score": 0.0,
+        "handling_score": 0.0,
+        "consistency_score": 0.0,
         "turns": [],
     }
 
-    # Build conversation incrementally
+    # Check if we should only evaluate the last turn
+    evaluate_last_only = method in beacon.LAST_TURN_ONLY_METHODS
+
+    # Generate responses for all turns
+    # NOTE: Following the original SafeDialBench logic:
+    # - Model generates response for each turn
+    # - But the conversation history uses the GROUND TRUTH bot responses,
+    #   not the model-generated responses (for fair evaluation)
+    model_responses = []
     conversation: List[Dict[str, str]] = []
+    system_prompt = dialogue.get("system")
     if system_prompt:
         conversation.append({"role": "system", "content": system_prompt})
 
-    for turn_index, turn in enumerate(user_turns):
-        user_content = turn.get("content", "")
+    for turn_index, turn in enumerate(history):
+        user_content = turn.get("user", "")
+        bot_content = turn.get("bot", "")  # Ground truth response
         conversation.append({"role": "user", "content": user_content})
 
         # Generate model response
@@ -140,37 +156,60 @@ def _evaluate_dialogue(
             do_sample=do_sample,
             top_p=top_p,
         )
+        model_responses.append(response)
+        # Use GROUND TRUTH bot response for conversation history (as per original SafeDialBench)
+        conversation.append({"role": "assistant", "content": bot_content})
 
-        # Add response to conversation for next turn
-        conversation.append({"role": "assistant", "content": response})
+    # Evaluate turns
+    scores_list = []
 
-        # Judge the response
-        judge_result = beacon.judge_response(
-            judge_client,
-            user_request=user_content,
-            response=response,
+    if evaluate_last_only:
+        turn_index = len(history) - 1
+        context = beacon.build_conversation_context(
+            history, model_responses, len(history), use_model_response_for_last=True
         )
+        scores, judgment = beacon.judge_dialogue_turn(judge_client, context, judge_prompt)
+        scores_list.append(scores)
 
-        turn_result = {
+        results["turns"].append({
             "turn_index": turn_index,
-            "user_content": user_content,
-            "response": response,
-            "judge_result": judge_result,
-        }
-        results["turns"].append(turn_result)
+            "user_content": history[turn_index].get("user", ""),
+            "response": model_responses[turn_index],
+            "scores": scores,
+            "judgment": judgment,
+        })
+    else:
+        for turn_index in range(len(history)):
+            context = beacon.build_conversation_context(
+                history, model_responses, turn_index + 1, use_model_response_for_last=True
+            )
+            scores, judgment = beacon.judge_dialogue_turn(judge_client, context, judge_prompt)
+            scores_list.append(scores)
 
-        # If jailbroken, stop evaluation for this dialogue
-        if judge_result["jailbroken"]:
-            results["jailbroken"] = True
-            results["jailbreak_turn"] = turn_index
-            break
+            results["turns"].append({
+                "turn_index": turn_index,
+                "user_content": history[turn_index].get("user", ""),
+                "response": model_responses[turn_index],
+                "scores": scores,
+                "judgment": judgment,
+            })
+
+    # Calculate final scores
+    if scores_list:
+        identification_scores = [s[0] for s in scores_list]
+        handling_scores = [s[1] for s in scores_list]
+        consistency_scores = [s[2] for s in scores_list]
+
+        results["identification_score"] = min(identification_scores)
+        results["handling_score"] = min(handling_scores)
+        results["consistency_score"] = min(consistency_scores)
 
     return results
 
 
 def _worker_output_path(log_dir: str, timestamp: str, run_tag: str, worker_id: int) -> str:
     return os.path.join(
-        log_dir, f"mhj_base_{timestamp}_{run_tag}.worker{worker_id}.json"
+        log_dir, f"safediabench_base_{timestamp}_{run_tag}.worker{worker_id}.json"
     )
 
 
@@ -184,6 +223,7 @@ def _run_worker(
     timestamp: str,
     run_tag: str,
     api_config: Dict[str, Any],
+    judge_prompts: Dict[str, Dict[str, Any]],
     max_new_tokens: int,
     temperature: float,
     do_sample: bool,
@@ -198,6 +238,7 @@ def _run_worker(
         model_path=model_path,
         device_id=cuda_id,
     )
+
     # Select judge client based on config provider
     judge_api_provider = api_config.get("judge_api_provider", "dashscope")
     if judge_api_provider == "hkustgz":
@@ -207,9 +248,9 @@ def _run_worker(
             timeout=api_config.get("request_timeout", 120),
             max_retries=api_config.get("max_retries", 3),
             retry_sleep=api_config.get("retry_sleep", 1.0),
-            temperature=api_config.get("temperature", 0.0),
+            temperature=api_config.get("temperature", 0.7),
             top_p=api_config.get("top_p", 1.0),
-            max_tokens=api_config.get("max_tokens", 512),
+            max_tokens=api_config.get("max_tokens", 2048),
         )
     else:
         judge_client = beacon.OpenAICompatClient(
@@ -219,9 +260,9 @@ def _run_worker(
             timeout=api_config.get("request_timeout", 120),
             max_retries=api_config.get("max_retries", 3),
             retry_sleep=api_config.get("retry_sleep", 1.0),
-            temperature=api_config.get("temperature", 0.0),
+            temperature=api_config.get("temperature", 0.7),
             top_p=api_config.get("top_p", 1.0),
-            max_tokens=api_config.get("max_tokens", 512),
+            max_tokens=api_config.get("max_tokens", 2048),
         )
 
     results: List[Dict[str, Any]] = []
@@ -229,9 +270,12 @@ def _run_worker(
     processed_dialogues = 0
 
     def flush() -> None:
-        jailbroken_count = sum(1 for r in results if r.get("jailbroken", False))
-        total_count = len(results)
-        asr = jailbroken_count / total_count if total_count > 0 else 0.0
+        if results:
+            avg_identification = sum(r["identification_score"] for r in results) / len(results)
+            avg_handling = sum(r["handling_score"] for r in results) / len(results)
+            avg_consistency = sum(r["consistency_score"] for r in results) / len(results)
+        else:
+            avg_identification = avg_handling = avg_consistency = 0.0
 
         output = {
             "meta": {
@@ -242,14 +286,15 @@ def _run_worker(
                 "num_workers": num_workers,
                 "run_tag": run_tag,
                 "judge_api_provider": api_config.get("judge_api_provider", "dashscope"),
-                "judge_model": api_config.get("hkustgz_model", "Qwen") if api_config.get("judge_api_provider") == "hkustgz" else api_config["judge_model"],
+                "judge_model": api_config.get("hkustgz_model", "Qwen") if api_config.get("judge_api_provider") == "hkustgz" else api_config.get("judge_model"),
                 "processed_dialogues": processed_dialogues,
                 "failed_dialogues": len(errors),
             },
             "metrics": {
-                "asr": asr,
-                "jailbroken_count": jailbroken_count,
-                "total_count": total_count,
+                "avg_identification": avg_identification,
+                "avg_handling": avg_handling,
+                "avg_consistency": avg_consistency,
+                "total_count": len(results),
             },
             "results": results,
             "errors": errors,
@@ -277,6 +322,7 @@ def _run_worker(
                     pipe=pipe,
                     tokenizer=tokenizer,
                     judge_client=judge_client,
+                    judge_prompts=judge_prompts,
                     max_new_tokens=max_new_tokens,
                     temperature=temperature,
                     do_sample=do_sample,
@@ -288,6 +334,7 @@ def _run_worker(
                     {
                         "dialogue_index": idx,
                         "id": dialogue.get("id"),
+                        "task": dialogue.get("task"),
                         "error": repr(e),
                     }
                 )
@@ -309,6 +356,7 @@ def _run_worker(
 def main(
     model_path: str,
     data_path: str,
+    prompts_dir: Optional[str] = None,
     config_path: Optional[str] = None,
     cuda_id: int = 0,
     cuda_ids: Optional[str] = None,
@@ -319,6 +367,10 @@ def main(
     top_p: Optional[float] = None,
     flush_every: int = 1,
     num_workers: int = 1,
+    enable_sampling: bool = False,
+    sample_size_a: int = 200,
+    sample_size_b: int = 200,
+    sample_seed: int = 42,
 ) -> str:
     try:
         from tqdm.auto import tqdm
@@ -330,17 +382,34 @@ def main(
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     api_config_path = config_path or os.path.join(
-        PROJECT_ROOT, "eval", "mhj", "mhj_config.json"
+        PROJECT_ROOT, "eval", "safediabench", "safediabench_config.json"
     )
     api_config = beacon._load_api_config(api_config_path)
 
+    # Load judge prompts
+    resolved_prompts_dir = prompts_dir or os.path.join(
+        PROJECT_ROOT, "eval", "safediabench", "judge_prompts"
+    )
+    judge_prompts = beacon.load_judge_prompts(resolved_prompts_dir)
+    if not judge_prompts:
+        raise ValueError(f"No judge prompts found in {resolved_prompts_dir}")
+
     run_tag = "base"
     output_path = os.path.join(
-        resolved_log_dir, f"mhj_base_{timestamp}_{run_tag}.json"
+        resolved_log_dir, f"safediabench_base_{timestamp}_{run_tag}.json"
     )
 
-    dialogues = beacon._load_mhj_dataset(data_path)
+    dialogues = beacon._load_safediabench_dataset(data_path)
     print(f"Loaded {len(dialogues)} dialogues from {data_path}")
+
+    # Apply sampling if enabled
+    if enable_sampling:
+        dialogues = beacon._sample_dataset(
+            dialogues,
+            sample_size_a=sample_size_a,
+            sample_size_b=sample_size_b,
+            seed=sample_seed,
+        )
 
     cuda_id_list = beacon._parse_cuda_ids(cuda_id=cuda_id, cuda_ids=cuda_ids)
     beacon._validate_cuda_ids(cuda_id_list)
@@ -386,6 +455,7 @@ def main(
                 "timestamp": timestamp,
                 "run_tag": run_tag,
                 "api_config": api_config,
+                "judge_prompts": judge_prompts,
                 "max_new_tokens": max_new_tokens,
                 "temperature": temperature,
                 "do_sample": do_sample,
@@ -400,7 +470,7 @@ def main(
 
     pbar = None
     if tqdm is not None:
-        pbar = tqdm(total=len(dialogues), desc="Evaluating MHJ", unit="dialogue")
+        pbar = tqdm(total=len(dialogues), desc="Evaluating SafeDialBench", unit="dialogue")
 
     last = 0
     try:
@@ -461,44 +531,69 @@ def main(
             print(f"[WARN] Failed to read {wp}: {e}")
 
     # Calculate final metrics
-    jailbroken_count = sum(1 for r in all_results if r.get("jailbroken", False))
-    total_count = len(all_results)
-    asr = jailbroken_count / total_count if total_count > 0 else 0.0
+    if all_results:
+        avg_identification = sum(r["identification_score"] for r in all_results) / len(all_results)
+        avg_handling = sum(r["handling_score"] for r in all_results) / len(all_results)
+        avg_consistency = sum(r["consistency_score"] for r in all_results) / len(all_results)
+        avg_overall = (avg_identification + avg_handling + avg_consistency) / 3
+    else:
+        avg_identification = avg_handling = avg_consistency = avg_overall = 0.0
 
-    # Calculate average jailbreak turn for successful attacks
-    # jailbreak_turn is 0-indexed, so we add 1 to get 1-indexed turn number
-    jailbreak_turns = [
-        r.get("jailbreak_turn", 0) + 1
-        for r in all_results
-        if r.get("jailbroken", False) and r.get("jailbreak_turn") is not None
-    ]
-    avg_jailbreak_turn = sum(jailbreak_turns) / len(jailbreak_turns) if jailbreak_turns else 0.0
-
-    # Calculate metrics by tactic
-    tactic_metrics: Dict[str, Dict[str, Any]] = {}
+    # Calculate metrics by task
+    task_metrics: Dict[str, Dict[str, Any]] = {}
     for r in all_results:
-        tactic = r.get("tactic", "unknown")
-        if tactic not in tactic_metrics:
-            tactic_metrics[tactic] = {"jailbroken": 0, "total": 0}
-        tactic_metrics[tactic]["total"] += 1
-        if r.get("jailbroken", False):
-            tactic_metrics[tactic]["jailbroken"] += 1
+        task = r.get("task", "unknown")
+        if task not in task_metrics:
+            task_metrics[task] = {
+                "identification_scores": [],
+                "handling_scores": [],
+                "consistency_scores": [],
+                "count": 0,
+            }
+        task_metrics[task]["identification_scores"].append(r["identification_score"])
+        task_metrics[task]["handling_scores"].append(r["handling_score"])
+        task_metrics[task]["consistency_scores"].append(r["consistency_score"])
+        task_metrics[task]["count"] += 1
 
-    for tactic, metrics in tactic_metrics.items():
-        metrics["asr"] = metrics["jailbroken"] / metrics["total"] if metrics["total"] > 0 else 0.0
+    for task, metrics in task_metrics.items():
+        count = metrics["count"]
+        metrics["avg_identification"] = sum(metrics["identification_scores"]) / count
+        metrics["avg_handling"] = sum(metrics["handling_scores"]) / count
+        metrics["avg_consistency"] = sum(metrics["consistency_scores"]) / count
+        metrics["avg_overall"] = (
+            metrics["avg_identification"] + metrics["avg_handling"] + metrics["avg_consistency"]
+        ) / 3
+        del metrics["identification_scores"]
+        del metrics["handling_scores"]
+        del metrics["consistency_scores"]
 
-    # Calculate metrics by source
-    source_metrics: Dict[str, Dict[str, Any]] = {}
+    # Calculate metrics by method
+    method_metrics: Dict[str, Dict[str, Any]] = {}
     for r in all_results:
-        source = r.get("source", "unknown")
-        if source not in source_metrics:
-            source_metrics[source] = {"jailbroken": 0, "total": 0}
-        source_metrics[source]["total"] += 1
-        if r.get("jailbroken", False):
-            source_metrics[source]["jailbroken"] += 1
+        method = r.get("method", "unknown")
+        if method not in method_metrics:
+            method_metrics[method] = {
+                "identification_scores": [],
+                "handling_scores": [],
+                "consistency_scores": [],
+                "count": 0,
+            }
+        method_metrics[method]["identification_scores"].append(r["identification_score"])
+        method_metrics[method]["handling_scores"].append(r["handling_score"])
+        method_metrics[method]["consistency_scores"].append(r["consistency_score"])
+        method_metrics[method]["count"] += 1
 
-    for source, metrics in source_metrics.items():
-        metrics["asr"] = metrics["jailbroken"] / metrics["total"] if metrics["total"] > 0 else 0.0
+    for method, metrics in method_metrics.items():
+        count = metrics["count"]
+        metrics["avg_identification"] = sum(metrics["identification_scores"]) / count
+        metrics["avg_handling"] = sum(metrics["handling_scores"]) / count
+        metrics["avg_consistency"] = sum(metrics["consistency_scores"]) / count
+        metrics["avg_overall"] = (
+            metrics["avg_identification"] + metrics["avg_handling"] + metrics["avg_consistency"]
+        ) / 3
+        del metrics["identification_scores"]
+        del metrics["handling_scores"]
+        del metrics["consistency_scores"]
 
     output = {
         "meta": {
@@ -510,34 +605,39 @@ def main(
             "num_dialogues": len(dialogues),
             "run_tag": run_tag,
             "judge_api_provider": api_config.get("judge_api_provider", "dashscope"),
-            "judge_model": api_config.get("hkustgz_model", "Qwen") if api_config.get("judge_api_provider") == "hkustgz" else api_config["judge_model"],
+            "judge_model": api_config.get("hkustgz_model", "Qwen") if api_config.get("judge_api_provider") == "hkustgz" else api_config.get("judge_model"),
             "attempted_items": len(all_results),
             "failed_dialogues": len(errors),
             "worker_outputs": worker_paths,
             "failed_workers": failed_workers,
         },
         "metrics": {
-            "asr": asr,
-            "jailbroken_count": jailbroken_count,
-            "total_count": total_count,
-            "avg_jailbreak_turn": avg_jailbreak_turn,
-            "by_tactic": tactic_metrics,
-            "by_source": source_metrics,
+            "avg_identification": avg_identification,
+            "avg_handling": avg_handling,
+            "avg_consistency": avg_consistency,
+            "avg_overall": avg_overall,
+            "total_count": len(all_results),
+            "by_task": task_metrics,
+            "by_method": method_metrics,
         },
         "results": all_results,
         "errors": errors,
     }
     beacon.write_json_atomic(output_path, output)
 
-    print("\n=== MHJ METRICS ===")
-    print(f"Attack Success Rate (ASR): {asr:.4f} ({jailbroken_count}/{total_count})")
-    print(f"Avg Jailbreak Turn (successful samples): {avg_jailbreak_turn:.2f}")
-    print("\nBy Tactic:")
-    for tactic, metrics in sorted(tactic_metrics.items()):
-        print(f"  {tactic}: {metrics['asr']:.4f} ({metrics['jailbroken']}/{metrics['total']})")
-    print("\nBy Source:")
-    for source, metrics in sorted(source_metrics.items()):
-        print(f"  {source}: {metrics['asr']:.4f} ({metrics['jailbroken']}/{metrics['total']})")
+    print("\n=== SafeDialBench METRICS ===")
+    print(f"Overall Scores (avg):")
+    print(f"  Identification: {avg_identification:.4f}")
+    print(f"  Handling:       {avg_handling:.4f}")
+    print(f"  Consistency:    {avg_consistency:.4f}")
+    print(f"  Overall:        {avg_overall:.4f}")
+    print(f"\nTotal dialogues evaluated: {len(all_results)}")
+    print("\nBy Task:")
+    for task, metrics in sorted(task_metrics.items()):
+        print(f"  {task}: I={metrics['avg_identification']:.2f} H={metrics['avg_handling']:.2f} C={metrics['avg_consistency']:.2f} (n={metrics['count']})")
+    print("\nBy Method:")
+    for method, metrics in sorted(method_metrics.items()):
+        print(f"  {method}: I={metrics['avg_identification']:.2f} H={metrics['avg_handling']:.2f} C={metrics['avg_consistency']:.2f} (n={metrics['count']})")
     print(f"\nSaved to: {output_path}")
 
     if failed_workers:
@@ -551,15 +651,22 @@ def main(
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Run MHJ Base evaluation.")
+    parser = argparse.ArgumentParser(description="Run SafeDialBench Base evaluation.")
     parser.add_argument("--model-path", "--model_path", dest="model_path", required=True)
     parser.add_argument("--data-path", "--data_path", dest="data_path", required=True)
+    parser.add_argument(
+        "--prompts-dir",
+        "--prompts_dir",
+        dest="prompts_dir",
+        default=None,
+        help="Path to directory containing judge prompt JSONL files.",
+    )
     parser.add_argument(
         "--config-path",
         "--config_path",
         dest="config_path",
         default=None,
-        help="Path to JSON config with openai_api_key/openai_base_url/judge_model.",
+        help="Path to JSON config with API configuration.",
     )
     parser.add_argument("--cuda-id", "--cuda_id", dest="cuda_id", type=int, default=0)
     parser.add_argument("--cuda-ids", "--cuda_ids", dest="cuda_ids", default=None)
@@ -570,11 +677,26 @@ if __name__ == "__main__":
     parser.add_argument("--top-p", "--top_p", dest="top_p", type=float, default=None)
     parser.add_argument("--flush-every", "--flush_every", dest="flush_every", type=int, default=1)
     parser.add_argument("--num-workers", "--num_workers", dest="num_workers", type=int, default=1)
+    # Sampling options
+    parser.add_argument(
+        "--enable-sampling", "--enable_sampling",
+        dest="enable_sampling",
+        action="store_true",
+        default=False,
+        help="Enable balanced sampling (200 samples each for case A and B by default).",
+    )
+    parser.add_argument("--sample-size-a", "--sample_size_a", dest="sample_size_a", type=int, default=200,
+                        help="Number of samples for case A (last-turn-only methods).")
+    parser.add_argument("--sample-size-b", "--sample_size_b", dest="sample_size_b", type=int, default=200,
+                        help="Number of samples for case B (all-turns methods).")
+    parser.add_argument("--sample-seed", "--sample_seed", dest="sample_seed", type=int, default=42,
+                        help="Random seed for sampling.")
     args = parser.parse_args()
 
     main(
         model_path=args.model_path,
         data_path=args.data_path,
+        prompts_dir=args.prompts_dir,
         config_path=args.config_path,
         cuda_id=args.cuda_id,
         cuda_ids=args.cuda_ids,
@@ -585,4 +707,8 @@ if __name__ == "__main__":
         top_p=args.top_p,
         flush_every=args.flush_every,
         num_workers=args.num_workers,
+        enable_sampling=args.enable_sampling,
+        sample_size_a=args.sample_size_a,
+        sample_size_b=args.sample_size_b,
+        sample_seed=args.sample_seed,
     )
