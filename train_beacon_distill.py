@@ -139,6 +139,21 @@ def parse_args() -> argparse.Namespace:
         help="Number of sink tokens retained at the beginning of each turn.",
     )
     parser.add_argument(
+        "--disable-turn-embedding",
+        action="store_true",
+        help="Ablation: remove beacon turn embedding from the beacon token embedding composition.",
+    )
+    parser.add_argument(
+        "--disable-num-beacons-embedding",
+        action="store_true",
+        help="Ablation: remove num_beacons embedding (compression-ratio awareness) from beacon embeddings.",
+    )
+    parser.add_argument(
+        "--disable-semantic-init",
+        action="store_true",
+        help="Ablation: disable semantic average initialization for beacon_embedding (use random init instead).",
+    )
+    parser.add_argument(
         "--beacon-recon-weight",
         type=float,
         default=0.0,
@@ -1255,6 +1270,17 @@ def main() -> None:
             config.max_beacon_num = args.max_beacon_num
         else:
             config.max_beacon_num = args.num_beacons
+        # Beacon embedding 消融开关（会随 config 一起保存到 checkpoint）
+        config.disable_turn_embedding = bool(args.disable_turn_embedding)
+        config.disable_num_beacons_embedding = bool(args.disable_num_beacons_embedding)
+        config.disable_semantic_init = bool(args.disable_semantic_init)
+
+        logger.info(
+            "Beacon embedding ablations -> disable_turn_embedding=%s, disable_num_beacons_embedding=%s, disable_semantic_init=%s",
+            config.disable_turn_embedding,
+            config.disable_num_beacons_embedding,
+            config.disable_semantic_init,
+        )
 
         model_cls = Qwen3ForCausalLM
         dtype = torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else None)

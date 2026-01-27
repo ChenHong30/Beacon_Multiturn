@@ -628,6 +628,12 @@ class Qwen3Model(Qwen3PreTrainedModel):
         if self.num_beacons_per_segment is None:
             self.num_beacons_per_segment = 16
 
+        # === Beacon Embedding 消融开关 ===
+        # 这些开关由训练脚本通过 config 传入，用于标准消融实验。
+        self.disable_turn_embedding = bool(getattr(config, "disable_turn_embedding", False))
+        self.disable_num_beacons_embedding = bool(getattr(config, "disable_num_beacons_embedding", False))
+        self.disable_semantic_init = bool(getattr(config, "disable_semantic_init", False))
+
         # 确保默认值不超过最大容量
         if self.num_beacons_per_segment > self.max_beacon_num:
             self.num_beacons_per_segment = self.max_beacon_num
@@ -674,7 +680,16 @@ class Qwen3Model(Qwen3PreTrainedModel):
                       如果未提供，则回退到使用 <|im_end|> 的embedding。
         """
         with torch.no_grad():
-            if tokenizer is not None:
+            # 关键改进：根据 hidden_size 缩放初始化 std
+            # 这确保辅助 embedding 相对于主 embedding 的比例在不同模型大小上保持一致
+            #
+            # 基准：hidden_size=1024 时使用 std=0.02
+            # 缩放公式：std = 0.02 * sqrt(1024 / hidden_size)
+            base_std = 0.02
+            scale_factor = (1024 / self.config.hidden_size) ** 0.5
+            scaled_std = base_std * scale_factor
+
+            if not self.disable_semantic_init and tokenizer is not None:
                 # 使用语义相关词汇的embedding平均值
                 semantic_words = ["summary", "compress", "overview", "condensed", "brief", "abstract"]
                 embeddings_list = []
@@ -697,26 +712,13 @@ class Qwen3Model(Qwen3PreTrainedModel):
                     im_end_embedding = self.embed_tokens.weight[self.im_end_id]
                     self.beacon_embedding.copy_(im_end_embedding)
                     print(f"\033[93m[Beacon Init] Fallback to <|im_end|> embedding\033[0m")
-            else:
+            elif not self.disable_semantic_init:
                 # 没有tokenizer时，回退到使用 <|im_end|> 的embedding
                 im_end_embedding = self.embed_tokens.weight[self.im_end_id]
                 self.beacon_embedding.copy_(im_end_embedding)
                 print(f"\033[93m[Beacon Init] Using <|im_end|> embedding (no tokenizer provided)\033[0m")
 
-            # 初始化 beacon position/turn/num embedding
-            #
-            # 关键改进：根据 hidden_size 缩放初始化 std
-            # 这确保辅助 embedding 相对于主 embedding 的比例在不同模型大小上保持一致
-            #
-            # 基准：hidden_size=1024 时使用 std=0.02
-            # 缩放公式：std = 0.02 * sqrt(1024 / hidden_size)
-            # - 0.6B (hidden_size=1024): std = 0.02
-            # - 1.7B (hidden_size=2048): std = 0.02 * sqrt(0.5) ≈ 0.0141
-            # - 4B+ (hidden_size=4096): std = 0.02 * sqrt(0.25) = 0.01
-            #
-            base_std = 0.02
-            scale_factor = (1024 / self.config.hidden_size) ** 0.5
-            scaled_std = base_std * scale_factor
+            # 初始化 beacon position/turn/num embedding（以及可选的 beacon_embedding）
 
             # 使用确定性种子确保初始化可复现
             # 保存当前 RNG 状态
@@ -727,6 +729,11 @@ class Qwen3Model(Qwen3PreTrainedModel):
             torch.manual_seed(42)
             if torch.cuda.is_available():
                 torch.cuda.manual_seed(42)
+
+            if self.disable_semantic_init:
+                # 消融：不使用语义平均初始化，改为标准随机初始化
+                nn.init.normal_(self.beacon_embedding, mean=0.0, std=scaled_std)
+                print(f"\033[93m[Beacon Init] Semantic init disabled -> random normal std={scaled_std:.4f}\033[0m")
 
             # 初始化 beacon position embedding
             nn.init.normal_(self.beacon_position_embedding, mean=0.0, std=scaled_std)
@@ -1286,15 +1293,22 @@ class Qwen3Model(Qwen3PreTrainedModel):
                             else:
                                 # 后备方案：根据beacon组计算轮次
                                 turn_id = min(i // current_num_beacons, self.max_turns - 1)
-                            # 基础 embedding + 归一化位置插值 embedding + 轮次 embedding + 数量感知 embedding
+                            # 基础 embedding + 归一化位置插值 embedding (+ 可选的轮次/数量感知编码)
                             # 使用 get_beacon_position_embedding 获取归一化位置的插值 embedding
                             # 这样无论 num_beacons 是 8 还是 64，相同相对位置的 beacon 都能获得一致的语义
-                            inputs_embeds[b, idx] = (
+                            beacon_emb = (
                                 self.beacon_embedding +
-                                self.get_beacon_position_embedding(pos_in_segment, current_num_beacons) +
-                                self.beacon_turn_embedding[turn_id] +
-                                self.num_beacons_embedding[current_num_beacons]
+                                self.get_beacon_position_embedding(pos_in_segment, current_num_beacons)
                             )
+
+                            if not self.disable_turn_embedding:
+                                beacon_emb = beacon_emb + self.beacon_turn_embedding[turn_id]
+
+                            if not self.disable_num_beacons_embedding:
+                                num_beacons_idx = min(current_num_beacons, self.max_beacon_num)
+                                beacon_emb = beacon_emb + self.num_beacons_embedding[num_beacons_idx]
+
+                            inputs_embeds[b, idx] = beacon_emb
             else:
                 inputs_embeds = self.embed_tokens(input_ids)
 
@@ -1307,6 +1321,19 @@ class Qwen3Model(Qwen3PreTrainedModel):
                         self.num_beacons_embedding.sum()  # 添加数量感知编码
                     ) * 0.0
                     inputs_embeds = inputs_embeds + dummy_beacon_emb
+
+        # Fix for DDP unused parameters issue (Ablations):
+        # 当开启消融时，某些参数不会参与前向图，但仍然 requires_grad=True，
+        # DDP 会因此报错。这里沿用原有 dummy 依赖思路，确保参数出现在计算图中。
+        if self.training:
+            dummy_ablation_dep = None
+            if self.disable_turn_embedding and self.beacon_turn_embedding.requires_grad:
+                dummy_ablation_dep = self.beacon_turn_embedding.sum() * 0.0
+            if self.disable_num_beacons_embedding and self.num_beacons_embedding.requires_grad:
+                num_dummy = self.num_beacons_embedding.sum() * 0.0
+                dummy_ablation_dep = num_dummy if dummy_ablation_dep is None else (dummy_ablation_dep + num_dummy)
+            if dummy_ablation_dep is not None:
+                inputs_embeds = inputs_embeds + dummy_ablation_dep
 
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache(config=self.config)
