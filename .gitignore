@@ -22,3 +22,4 @@ beacon_inference.py
 beacon_inference_incremental.py
 modeling_qwen3_incremental.py
 verify/
+analysis
